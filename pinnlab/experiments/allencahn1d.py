@@ -1,4 +1,3 @@
-# pinnlab/experiments/allencahn1d.py
 import math
 import torch
 from pinnlab.experiments.base import BaseExperiment, make_leaf, grad_sum

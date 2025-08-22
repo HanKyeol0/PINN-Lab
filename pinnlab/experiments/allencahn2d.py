@@ -1,4 +1,3 @@
-# pinnlab/experiments/allencahn2d.py
 import math
 import torch
 import numpy as np

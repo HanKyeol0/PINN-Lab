@@ -1,0 +1,7 @@
+domain: {x: [0.0, 1.0], y: [0.0, 1.0]}
+bc_case: "sine"
+eval_fd: {nx: 129, ny: 129, iters: 5000, tol: 1.0e-6}
+batch:
+  n_f: 1024             # collocation points
+  n_b: 512             # boundary points
+  n_0: 512             # initial points (if applicable)

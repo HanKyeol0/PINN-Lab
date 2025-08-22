@@ -1,4 +1,3 @@
-# pinnlab/experiments/helmholtz2d_steady.py
 import math
 import numpy as np
 import torch

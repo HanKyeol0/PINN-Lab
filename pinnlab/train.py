@@ -8,6 +8,7 @@ from pinnlab.utils.early_stopping import EarlyStopping
 from pinnlab.utils.plotting import save_plots_1d, save_plots_2d
 from pinnlab.utils.wandb_utils import setup_wandb, wandb_log, wandb_finish
 from pinnlab.utils.gradflow import GradientFlowLogger
+from pinnlab.utils.lora import apply_lora, mark_only_lora_as_trainable
 
 def load_yaml(path):
     with open(path, "r", encoding="utf-8") as f:
@@ -29,6 +30,17 @@ def main(args):
     device = torch.device(base_cfg["device"] if torch.cuda.is_available() else "cpu")
     exp = get_experiment(args.experiment_name)(exp_cfg, device)
     model = get_model(args.model_name)(model_cfg).to(device)
+
+    # --- LoRA from config (optional) ---
+    ft_cfg = base_cfg.get("finetune", {}).get("lora", {}) or {}
+    if ft_cfg.get("enabled", False):
+        apply_lora(model, r=ft_cfg.get("r", 4), alpha=ft_cfg.get("alpha", 1.0), dropout=ft_cfg.get("dropout", 0.0))
+        if not ft_cfg.get("train_base", False):
+            mark_only_lora_as_trainable(model)
+
+    if getattr(args, "resume_from", None):
+        sd = torch.load(args.resume_from, map_location=device)
+        model.load_state_dict(sd, strict=False)   # strict=False to allow LoRA heads to be new
 
     # Optimizer
     opt_cfg = base_cfg["train"]["optimizer"]
@@ -73,9 +85,9 @@ def main(args):
     w_b = base_cfg["train"]["loss_weights"]["b"]
     w_ic= base_cfg["train"]["loss_weights"]["ic"]
 
-    n_f = base_cfg["train"]["batch"]["n_f"]
-    n_b = base_cfg["train"]["batch"]["n_b"]
-    n_0 = base_cfg["train"]["batch"]["n_0"]
+    n_f = exp_cfg.get("batch", {}).get("n_f", base_cfg["train"]["batch"]["n_f"])
+    n_b = exp_cfg.get("batch", {}).get("n_b", base_cfg["train"]["batch"]["n_b"])
+    n_0 = exp_cfg.get("batch", {}).get("n_0", base_cfg["train"]["batch"]["n_0"])
 
     epochs = base_cfg["train"]["epochs"]
 
@@ -122,6 +134,7 @@ def main(args):
         pbar.set_postfix({k: f"{v:.3e}" for k,v in log_dict.items() if "loss" in k})
 
         # Simple validation metric (relative L2 on a fixed grid)
+        best_path = os.path.join(out_dir, "best.pt")
         if ep % 500 == 0 or ep == epochs-1:
             with torch.no_grad():
                 rel_l2 = exp.relative_l2_on_grid(model, base_cfg["eval"]["grid"])
@@ -129,6 +142,7 @@ def main(args):
                 if rel_l2 < best_metric:
                     best_metric = rel_l2
                     best_state = {k: v.clone() for k,v in model.state_dict().items()}
+                    torch.save({k:v.detach().cpu() for k,v in best_state.items()}, best_path)
 
             if early and early.step(best_metric):
                 print(f"\n[EarlyStopping] Stopping at epoch {ep}. Best rel_l2={best_metric:.3e}")
@@ -160,5 +174,6 @@ if __name__ == "__main__":
     parser.add_argument("--common_config", required=True)
     parser.add_argument("--model_config", required=True)
     parser.add_argument("--exp_config", required=True)
+    parser.add_argument("--resume_from", default=None)
     args = parser.parse_args()
     main(args)

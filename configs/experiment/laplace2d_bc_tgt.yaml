@@ -1,0 +1,4 @@
+domain: {x: [0.0, 1.0], y: [0.0, 1.0]}
+bc_case: "gaussian"
+gaussian: {x0: 0.35, y0: 0.65, sigma: 0.15}
+eval_fd: {nx: 129, ny: 129, iters: 5000, tol: 1.0e-6}

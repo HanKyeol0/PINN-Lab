@@ -30,7 +30,7 @@ class Helmholtz2DSteady(BaseExperiment):
 
     # ----- analytic fields -----
     def u_star(self, x, y):
-        return torch.sin(self.a1 * math.pi * x) * torch.sin(self.a2 * math.pi * y)
+        return torch.sin(self.a1 * math.pi * x) * torch.sin(2 * self.a2 * math.pi * y)
 
     def f(self, x, y):
         coeff = (-(self.a1**2 + self.a2**2) * (math.pi**2) + self.lam)

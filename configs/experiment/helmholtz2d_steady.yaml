@@ -1,6 +1,11 @@
 domain:
-  x: [-1, 1]
-  y: [-1, 1]
+  x: [-3, 3]
+  y: [-3, 3]
 a1: 1.0
 a2: 4.0
 lambda: 1.0
+batch:
+  n_f: 8192             # collocation points
+  n_b: 2048             # boundary points
+  n_0: 2048             # initial points (if applicable)
+log_path: dom_33_bc_2siny

@@ -51,7 +51,11 @@ def main(args):
 
     # Logging dir
     ts = time.strftime("%Y%m%d-%H%M%S")
-    out_dir = os.path.join(base_cfg["log"]["out_dir"], f"{args.experiment_name}_{args.model_name}_{ts}")
+    log_path = exp_cfg.get("log_path")
+    if log_path:
+        out_dir = os.path.join(base_cfg["log"]["out_dir"], f"{args.experiment_name}_{args.model_name}_{log_path}")
+    else:
+        out_dir = os.path.join(base_cfg["log"]["out_dir"], f"{args.experiment_name}_{args.model_name}_{ts}")
     os.makedirs(out_dir, exist_ok=True)
 
     # WandB

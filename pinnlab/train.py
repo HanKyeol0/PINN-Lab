@@ -1,4 +1,4 @@
-import os, time, yaml, argparse, math, sys
+import os, time, yaml, argparse, sys
 import torch
 import wandb
 from tqdm import trange
@@ -8,11 +8,14 @@ from pinnlab.utils.early_stopping import EarlyStopping
 from pinnlab.utils.plotting import save_plots_1d, save_plots_2d
 from pinnlab.utils.wandb_utils import setup_wandb, wandb_log, wandb_finish
 from pinnlab.utils.gradflow import GradientFlowLogger
-from pinnlab.utils.lora import apply_lora, mark_only_lora_as_trainable
 
 def load_yaml(path):
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
+def _save_yaml(path, obj):
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(obj, f)
 
 def main(args):
     base_cfg = load_yaml(args.common_config)
@@ -31,17 +34,6 @@ def main(args):
     exp = get_experiment(args.experiment_name)(exp_cfg, device)
     model = get_model(args.model_name)(model_cfg).to(device)
 
-    # --- LoRA from config (optional) ---
-    ft_cfg = base_cfg.get("finetune", {}).get("lora", {}) or {}
-    if ft_cfg.get("enabled", False):
-        apply_lora(model, r=ft_cfg.get("r", 4), alpha=ft_cfg.get("alpha", 1.0), dropout=ft_cfg.get("dropout", 0.0))
-        if not ft_cfg.get("train_base", False):
-            mark_only_lora_as_trainable(model)
-
-    if getattr(args, "resume_from", None):
-        sd = torch.load(args.resume_from, map_location=device)
-        model.load_state_dict(sd, strict=False)   # strict=False to allow LoRA heads to be new
-
     # Optimizer
     opt_cfg = base_cfg["train"]["optimizer"]
     if opt_cfg["name"].lower() == "adam":
@@ -51,12 +43,12 @@ def main(args):
 
     # Logging dir
     ts = time.strftime("%Y%m%d-%H%M%S")
-    log_path = exp_cfg.get("log_path")
-    if log_path:
-        out_dir = os.path.join(base_cfg["log"]["out_dir"], f"{args.experiment_name}_{args.model_name}_{log_path}")
-    else:
-        out_dir = os.path.join(base_cfg["log"]["out_dir"], f"{args.experiment_name}_{args.model_name}_{ts}")
+    out_dir = os.path.join(base_cfg["log"]["out_dir"], f"{args.experiment_name}_{args.model_name}_{ts}")
     os.makedirs(out_dir, exist_ok=True)
+
+    _save_yaml(os.path.join(out_dir, "config.yaml"), {
+        "base": base_cfg, "model": model_cfg, "experiment": exp_cfg
+    })
 
     # WandB
     if base_cfg["log"]["wandb"]["enabled"]:
@@ -178,6 +170,5 @@ if __name__ == "__main__":
     parser.add_argument("--common_config", required=True)
     parser.add_argument("--model_config", required=True)
     parser.add_argument("--exp_config", required=True)
-    parser.add_argument("--resume_from", default=None)
     args = parser.parse_args()
     main(args)

@@ -1,4 +1,3 @@
-# Toggle this:
 time_dependent: true   # false -> Poisson; true -> Heat (time-dependent)
 
 domain:
@@ -21,3 +20,8 @@ lambda: auto            # "auto" -> lambda = 2*kappa*pi^2 (f=0); or set a number
 # IMPORTANT: Set input dimension to match the toggle
 in_features: 3          # set 3 when time_dependent: true
 out_features: 1
+
+batch:
+  n_f: 4096             # collocation points
+  n_b: 1024             # boundary points
+  n_0: 1024             # initial points (if applicable)

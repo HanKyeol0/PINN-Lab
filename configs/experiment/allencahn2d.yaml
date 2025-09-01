@@ -3,7 +3,6 @@ domain:
   y: [0.0, 3.0]
   t: [0.0, 5.0]
 eps: 0.01
-omega: 4.0
+omega: 6.0
 in_features: 3
 out_features: 1
-log_path: 333_001_40

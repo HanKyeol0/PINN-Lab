@@ -1,5 +1,5 @@
 # pinnlab/utils/gradflow.py
-import os, json, math, numpy as np, torch, re
+import os, json, math, numpy as np, torch, re, matplotlib.pyplot as plt, seaborn as sns
 from collections import OrderedDict
 
 def _ensure_dir(p): os.makedirs(p, exist_ok=True)
@@ -98,6 +98,9 @@ class GradientFlowLogger:
         self.wandb_hist = bool(wandb_hist)
         self.device = device or next(model.parameters()).device
         self.out_dir = os.path.join(out_dir, "gradflow")
+        self.plot_loss_kde_enabled = bool(plot_cfg.get("loss_kde", True))
+        self.loss_kde_filename = str(plot_cfg.get("loss_kde_filename", "gradflow_kde_losses.png"))
+
         _ensure_dir(self.out_dir)
 
         self.layers, self.params, self.layer_slices = list_linear_layers(model)
@@ -186,6 +189,13 @@ class GradientFlowLogger:
                 g_flat = torch.cat(g_parts, dim=0)
                 self._record_stats(loss_name, layer_name, g_flat)
 
+                if self.store_vectors:
+                    arr = g_flat.detach().cpu().numpy()
+                    L = self.vecs.setdefault(loss_name, {}).setdefault(layer_name, [])
+                    if len(L) >= self.max_keep:
+                        L.pop(0)
+                    L.append(arr)
+
                 tag = self.layer_tags.get(layer_name, None)
                 if tag in ("main","skip"):
                     # group stats
@@ -254,6 +264,11 @@ class GradientFlowLogger:
             if p2: saved.append(p2)
         if self.plot_stats_enabled:
             saved.extend(self._plot_stats_paths())
+        if self.plot_kde_enabled and self.plot_loss_kde_enabled:
+            p3 = self._plot_kde_losses()
+            if p3:
+                print("Plotting KDE for loss...")
+                saved.append(p3)
 
         return saved
 
@@ -290,7 +305,6 @@ class GradientFlowLogger:
                         # fallback: density histogram
                         ax.hist(g, bins=100, density=True, histtype="step", label=ln.upper())
                 ax.set_title(layer)
-                ax.set_xlim([-3.0, 3.0])
                 if idx == 0: ax.legend()
 
             # hide any empty axes
@@ -335,13 +349,48 @@ class GradientFlowLogger:
                     else:
                         ax.hist(g, bins=120, density=True, histtype="step", label=f"{ln.upper()} | {tag}")
                 ax.set_title(f"Gradient KDE by path ({ln})")
-                ax.set_xlim([-3.0, 3.0]); ax.legend()
+                # ax.set_xlim([-3.0, 3.0])
+                ax.legend()
                 plt.tight_layout()
                 out = os.path.join(self.out_dir, f"gradflow_kde_paths_{ln}.png")
                 fig.savefig(out, dpi=160); plt.close(fig)
                 outs.append(out)
             # return first (for API); save_plots already returns list anyway
             return outs[0] if outs else None
+        except Exception:
+            return None
+    
+    def _plot_kde_losses(self):
+        """Aggregate ALL linear-layer grads per loss into one vector and overlay KDEs."""
+        if not (self.store_vectors and self.vecs):
+            print("No vectors to plot")
+            return None
+        try:
+            # concatenate last-snapshot vectors across all layers for each loss
+            agg = {}
+            for ln in self.plot_losses:
+                chunks = []
+                for layer in self.layer_names:
+                    print("layer:", layer)
+                    arrs = self.vecs.get(ln, {}).get(layer, [])
+                    if arrs: chunks.append(np.asarray(arrs[-1]).ravel())
+                    print("chunks", chunks)
+                if chunks:
+                    agg[ln] = np.concatenate(chunks, axis=0)
+
+            if len(agg) == 0:
+                return None
+
+            fig, ax = plt.subplots(figsize=(5.6, 3.6))
+            for ln, vec in agg.items():
+                label = ln.upper()
+                sns.kdeplot(vec, ax=ax, label=label, bw_method="scott", fill=False)
+            ax.set_title("Gradient KDE by loss (aggregated layers)")
+            ax.legend()
+            plt.tight_layout()
+            out = os.path.join(self.out_dir, self.loss_kde_filename)
+            fig.savefig(out, dpi=160); plt.close(fig)
+            return out
         except Exception:
             return None
     

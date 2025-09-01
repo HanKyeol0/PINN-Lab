@@ -96,6 +96,7 @@ def main(args):
         leave=False,          # don't leave old bars behind
         disable=not use_tty,  # if output is piped, avoid multiline spam
     )
+    gf_stop = base_cfg["gradflow"]["stop_at"]
 
     for ep in pbar:
         model.train()
@@ -109,7 +110,8 @@ def main(args):
         loss_b_s = loss_b.mean() if torch.is_tensor(loss_b) and loss_b.dim() > 0 else loss_b
         loss_0_s = loss_0.mean() if torch.is_tensor(loss_0) and loss_0.dim() > 0 else loss_0
 
-        gf.collect({"res": loss_f_s, "bc": loss_b_s, "ic": loss_0_s})
+        if ep <= gf_stop:
+            gf.collect({"res": loss_f_s, "bc": loss_b_s, "ic": loss_0_s})
 
         total_loss = w_f*loss_f + w_b*loss_b + w_ic*loss_0
 

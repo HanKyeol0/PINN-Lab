@@ -1,17 +1,17 @@
 seed: 42
 device: "cuda"            # "cuda" or "cpu"
 train:
-  epochs: 500
+  epochs: 20000
   batch:
-    n_f: 4096             # collocation points
-    n_b: 1024             # boundary points
-    n_0: 1024             # initial points (if applicable)
+    n_f: 8192             # collocation points
+    n_b: 2048             # boundary points
+    n_0: 2048             # initial points (if applicable)
   optimizer:
     name: adam
     lr: 1.0e-3
   early_stopping:
     enabled: true
-    patience: 1000
+    patience: 10000
     min_delta: 1.0e-5
   loss_weights:
     f: 1.0    # PDE residual
@@ -29,6 +29,7 @@ eval:
     nx: 200
     ny: 200
     nt: 100
+  every: 100
 gradflow:
   enabled: true
   every: 200

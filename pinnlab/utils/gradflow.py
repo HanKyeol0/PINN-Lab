@@ -371,10 +371,8 @@ class GradientFlowLogger:
             for ln in self.plot_losses:
                 chunks = []
                 for layer in self.layer_names:
-                    print("layer:", layer)
                     arrs = self.vecs.get(ln, {}).get(layer, [])
                     if arrs: chunks.append(np.asarray(arrs[-1]).ravel())
-                    print("chunks", chunks)
                 if chunks:
                     agg[ln] = np.concatenate(chunks, axis=0)
 

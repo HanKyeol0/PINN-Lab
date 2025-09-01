@@ -1,6 +1,6 @@
 in_features: 2
 hidden_dim: 64
 out_features: 1
-num_blocks: 4
+num_blocks: 5
 activation: tanh # tanh, relu, sine
 layers_per_block: 3

@@ -1,0 +1,23 @@
+scripts/mlp/allencahn2d.sh
+scripts/residual_network/allencahn2d.sh
+
+scripts/mlp/helmholtz2d_steady.sh
+scripts/residual_network/helmholtz2d_steady.sh
+
+scripts/mlp/helmholtz2d.sh
+scripts/residual_network/helmholtz2d.sh
+
+scripts/mlp/reactiondiffusion2d.sh
+scripts/residual_network/reactiondiffusion2d.sh
+
+scripts/mlp/poisson2d.sh
+scripts/residual_network/poisson2d.sh
+
+scripts/mlp/navierstokes2d.sh
+scripts/residual_network/navierstokes2d.sh
+
+scripts/mlp/reactiondiffusion2d.sh
+scripts/residual_network/reactiondiffusion2d.sh
+
+# patch experiment
+scripts/patch_attention/helmholtz2d_steady_patch.sh

@@ -1,7 +1,7 @@
 seed: 40
 device: "cuda"            # "cuda" or "cpu"
 train:
-  epochs: 20000
+  epochs: 50000
   batch:
     n_f: 4096             # collocation points
     n_b: 1024             # boundary points

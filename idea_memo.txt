@@ -1,0 +1,7 @@
+[Patch로 입력했을 때 IC/BC를 학습시키는 방법]
+
+1. 그냥 IC/BC point를 포함한 patch에 대해서만 해당 point의 IC/BC loss를 계산
+
+2. patch 단위로 PDE 예측을 먼저 한 다음에 initial/boundary condition에 맞게 projection
+projector 말고도 fine-tuning 개념으로 접근할 수 있을까?
+https://chatgpt.com/share/68c68474-3e28-800d-a3e2-1dd1e1c3039d

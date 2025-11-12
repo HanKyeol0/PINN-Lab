@@ -2,6 +2,5 @@ outputs/
 .env
 wandb/
 .ipynb
-sh_paths.txt
 experimental_result_memo.txt
 .gitignore

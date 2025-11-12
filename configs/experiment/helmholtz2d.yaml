@@ -1,3 +1,8 @@
+# scripts/mlp/helmholtz2d.sh
+
+tag: test0
+devide: cuda:0
+
 domain:
   x: [-2.0, 2.0]
   y: [-2.0, 2.0]
@@ -8,3 +13,25 @@ omega: auto
 in_features: 3 # (x,y,t) or (x,y); here steady: use (x,y)
 out_features: 1
 time_dependent: true
+
+# sampling
+sampling_mode: grid # random / grid
+grid:
+  nx: 256
+  ny: 256
+  nt: 256
+batch:
+  n_f: 4096
+  n_b: 1024
+  n_0: 1024
+
+# video
+video:
+  enabled: false
+  every: 5000
+  grid:
+    nx: 256
+    ny: 256
+    nt: 256
+  fps: 10
+  format: mp4

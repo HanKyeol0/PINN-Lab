@@ -3,3 +3,14 @@ domain:
   t: [0.0, 1.0]
 eps: 0.01
 omega: 2.0
+
+# sampling
+sampling_mode: random # random / grid
+grid:
+  nx: 256
+  ny: 256
+  nt: 256
+batch:
+  n_f: 4096
+  n_b: 1024
+  n_0: 1024

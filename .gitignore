@@ -3,4 +3,6 @@ outputs/
 wandb/
 .ipynb
 experimental_result_memo.txt
+idea_memo.txt
 .gitignore
+__pycache__/

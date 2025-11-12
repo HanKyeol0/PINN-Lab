@@ -47,6 +47,24 @@ class Poisson2D(BaseExperiment):
             self.input_dim = 3
         else:
             self.input_dim = 2
+            
+        self.sampling_mode = cfg.get("sampling_mode", "random") # random / grid
+        if self.sampling_mode == "grid":
+            g = cfg.get("grid", {})
+            nx, ny = int(g.get("nx", 100)), int(g.get("ny", 100))
+            
+            Xg, Yg = linspace_2d(self.rect.xa, self.rect.xb, self.rect.ya, self.rect.yb, nx, ny, device)
+            XY = torch.stack([Xg.reshape(-1), Yg.reshape(-1)], dim=1)  # [nx*ny, 2]
+            self._XY = XY
+            
+            if self.time_dep:
+                nt = int(g.get("nt", 100))
+                self._T = torch.linspace(self.t0, self.t1, nt, device=device) # [nt]
+            
+            # boundary subset (any edge)
+            xa, xb, ya, yb = self.rect.xa, self.rect.xb, self.rect.ya, self.rect.yb
+            mask_b = XY[:,0].eq(xa) | XY[:,0].eq(xb) | XY[:,1].eq(ya) | XY[:,1].eq(yb)
+            self._XYb = XY[mask_b]  # [nb, 2]
 
     # ---------- analytic fields ----------
     def u_star_steady(self, x, y):
@@ -66,49 +84,84 @@ class Poisson2D(BaseExperiment):
 
     # ---------- sampling ----------
     def sample_batch(self, n_f, n_b, n_0):
-        if self.time_dep:
-            # Interior (x,y,t)
-            XY = self.rect.sample(n_f)
-            t_f = torch.rand(n_f, 1, device=self.rect.device) * (self.t1 - self.t0) + self.t0
-            X_f = torch.cat([XY, t_f], dim=1)
+        if self.sampling_mode == "random":
+            if self.time_dep:
+                # Interior (x,y,t)
+                X_f_xy = self.rect.sample(n_f)
+                t_f = torch.rand(n_f, 1, device=self.rect.device) * (self.t1 - self.t0) + self.t0
+                X_f = torch.cat([X_f_xy, t_f], dim=1)
 
-            # Boundary over space at random t
-            nb = max(1, n_b // 4)
-            xa, xb, ya, yb = self.rect.xa, self.rect.xb, self.rect.ya, self.rect.yb
-            t_b = torch.rand(4 * nb, 1, device=self.rect.device) * (self.t1 - self.t0) + self.t0
+                # Boundary over space at random t
+                xa, xb, ya, yb = self.rect.xa, self.rect.xb, self.rect.ya, self.rect.yb
+                t_b = torch.rand(4 * n_b, 1, device=self.rect.device) * (self.t1 - self.t0) + self.t0
 
-            y = torch.rand(nb, 1, device=self.rect.device) * (yb - ya) + ya
-            x = torch.rand(nb, 1, device=self.rect.device) * (xb - xa) + xa
-            top    = torch.cat([x, torch.full_like(x, yb)], 1)
-            bottom = torch.cat([x, torch.full_like(x, ya)], 1)
-            left   = torch.cat([torch.full_like(y, xa), y], 1)
-            right  = torch.cat([torch.full_like(y, xb), y], 1)
-            X_b_spatial = torch.cat([top, bottom, left, right], dim=0)
-            X_b = torch.cat([X_b_spatial, t_b], dim=1)
-            u_b = self.u_star_time(X_b[:, 0:1], X_b[:, 1:2], X_b[:, 2:3])
+                y = torch.rand(n_b, 1, device=self.rect.device) * (yb - ya) + ya
+                x = torch.rand(n_b, 1, device=self.rect.device) * (xb - xa) + xa
+                top    = torch.cat([x, torch.full_like(x, yb)], 1)
+                bottom = torch.cat([x, torch.full_like(x, ya)], 1)
+                left   = torch.cat([torch.full_like(y, xa), y], 1)
+                right  = torch.cat([torch.full_like(y, xb), y], 1)
+                X_b_spatial = torch.cat([top, bottom, left, right], dim=0)
+                X_b = torch.cat([X_b_spatial, t_b], dim=1)
+                u_b = self.u_star_time(X_b[:, 0:1], X_b[:, 1:2], X_b[:, 2:3])
 
-            # Initial condition at t = t0
-            XY0 = self.rect.sample(n_0)
-            t0 = torch.full((n_0, 1), self.t0, device=self.rect.device)
-            X_0 = torch.cat([XY0, t0], dim=1)
-            u0 = self.u_star_time(X_0[:, 0:1], X_0[:, 1:2], X_0[:, 2:3])
+                # Initial condition at t = t0
+                x0y0 = self.rect.sample(n_0)
+                t0 = torch.full((n_0, 1), self.t0, device=self.rect.device)
+                X_0 = torch.cat([x0y0, t0], dim=1)
+                u0 = self.u_star_time(X_0[:, 0:1], X_0[:, 1:2], X_0[:, 2:3])
 
-            return {"X_f": X_f, "X_b": X_b, "u_b": u_b, "X_0": X_0, "u0": u0}
-        else:
-            # Steady: interior (x,y)
-            X_f = self.rect.sample(n_f)
-            # Boundary at all 4 edges (Dirichlet from u*)
-            nb = max(1, n_b // 4)
-            xa, xb, ya, yb = self.rect.xa, self.rect.xb, self.rect.ya, self.rect.yb
-            y = torch.rand(nb, 1, device=self.rect.device) * (yb - ya) + ya
-            x = torch.rand(nb, 1, device=self.rect.device) * (xb - xa) + xa
-            top    = torch.cat([x, torch.full_like(x, yb)], 1)
-            bottom = torch.cat([x, torch.full_like(x, ya)], 1)
-            left   = torch.cat([torch.full_like(y, xa), y], 1)
-            right  = torch.cat([torch.full_like(y, xb), y], 1)
-            X_b = torch.cat([top, bottom, left, right], dim=0)
-            u_b = self.u_star_steady(X_b[:, 0:1], X_b[:, 1:2])
-            return {"X_f": X_f, "X_b": X_b, "u_b": u_b}
+                return {"X_f": X_f, "X_b": X_b, "u_b": u_b, "X_0": X_0, "u0": u0}
+            else:
+                # Steady: interior (x,y)
+                X_f = self.rect.sample(n_f)
+                # Boundary at all 4 edges (Dirichlet from u*)
+                xa, xb, ya, yb = self.rect.xa, self.rect.xb, self.rect.ya, self.rect.yb
+                y = torch.rand(n_b, 1, device=self.rect.device) * (yb - ya) + ya
+                x = torch.rand(n_b, 1, device=self.rect.device) * (xb - xa) + xa
+                top    = torch.cat([x, torch.full_like(x, yb)], 1)
+                bottom = torch.cat([x, torch.full_like(x, ya)], 1)
+                left   = torch.cat([torch.full_like(y, xa), y], 1)
+                right  = torch.cat([torch.full_like(y, xb), y], 1)
+                X_b = torch.cat([top, bottom, left, right], dim=0)
+                u_b = self.u_star_steady(X_b[:, 0:1], X_b[:, 1:2])
+                return {"X_f": X_f, "X_b": X_b, "u_b": u_b}
+        elif self.sampling_mode == "grid":
+            if self.time_dep:
+                M, T = self._XY.size(0), self._T.size(0)
+
+                # interior
+                idx_xy = torch.randint(0, M, (n_f,), device=self.device)
+                idx_t  = torch.randint(0, T, (n_f,), device=self.device)
+                X_f = torch.cat([self._XY[idx_xy], self._T[idx_t].unsqueeze(1)], dim=1)
+                
+                # boundary (any edge)
+                mb = self._XYb.size(0)
+                idx_b = torch.randint(0, mb, (n_b,), device=self.device)
+                idx_bt = torch.randint(0, T, (n_b,), device=self.device)
+                X_b = torch.cat([self._XYb[idx_b], self._T[idx_bt].unsqueeze(1)], dim=1)
+                u_b = self.u_star(X_b[:,0:1], X_b[:,1:2], X_b[:,2:3])
+
+                # initial (t = t0)
+                idx0 = torch.randint(0, M, (n_0,), device=self.device)
+                X_0 = torch.cat([self._XY[idx0], torch.full((n_0,1), self.t0, device=self.device)], dim=1)
+                u0 = self.u_star(X_0[:,0:1], X_0[:,1:2], X_0[:,2:3])
+
+                return {"X_f": X_f, "X_b": X_b, "u_b": u_b, "X_0": X_0, "u0": u0}
+            else:
+                M = self._XY.size(0)
+
+                # interior
+                idx_xy = torch.randint(0, M, (n_f,), device=self.device)
+                X_f = self._XY[idx_xy]
+
+                # boundary (any edge)
+                mb = self._XYb.size(0)
+                idx_b = torch.randint(0, mb, (n_b,), device=self.device)
+                X_b = self._XYb[idx_b]
+                u_b = self.u_star_steady(X_b[:,0:1], X_b[:,1:2])
+
+                return {"X_f": X_f, "X_b": X_b, "u_b": u_b}
 
     # ---------- losses ----------
     def pde_residual_loss(self, model, batch):

@@ -1,3 +1,5 @@
+# scripts/mlp/helmholtz2d.sh
+
 #!/usr/bin/env bash
 set -e
 

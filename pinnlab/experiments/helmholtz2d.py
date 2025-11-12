@@ -1,6 +1,5 @@
-import math
+import math, os, numpy as np
 import torch
-import numpy as np
 
 from pinnlab.experiments.base import BaseExperiment, make_leaf, grad_sum
 from pinnlab.data.geometries import Rectangle, linspace_2d
@@ -24,6 +23,7 @@ class Helmholtz2D(BaseExperiment):
 
     def __init__(self, cfg, device):
         super().__init__(cfg, device)
+        self.device = device
         xa, xb = cfg["domain"]["x"]
         ya, yb = cfg["domain"]["y"]
         self.t0, self.t1 = cfg["domain"]["t"]
@@ -36,6 +36,21 @@ class Helmholtz2D(BaseExperiment):
             self.omega = math.sqrt(2.0) * math.pi * self.c
         else:
             self.omega = float(omega_cfg)
+        
+        self.sampling_mode = cfg.get("sampling_mode", "random") # random / grid
+        if self.sampling_mode == "grid":
+            g = cfg.get("grid", {})
+            nx, ny, nt = int(g.get("nx", 100)), int(g.get("ny", 100)), int(g.get("nt", 100))
+            
+            Xg, Yg = linspace_2d(self.rect.xa, self.rect.xb, self.rect.ya, self.rect.yb, nx, ny, device)
+            XY = torch.stack([Xg.reshape(-1), Yg.reshape(-1)], dim=1)  # [nx*ny, 2]
+            self._XY = XY
+            self._T = torch.linspace(self.t0, self.t1, nt, device=device) # [nt]
+            
+            # boundary subset (any edge)
+            xa, xb, ya, yb = self.rect.xa, self.rect.xb, self.rect.ya, self.rect.yb
+            mask_b = XY[:,0].eq(xa) | XY[:,0].eq(xb) | XY[:,1].eq(ya) | XY[:,1].eq(yb)
+            self._XYb = XY[mask_b]  # [nb, 2]
 
     # ----- analytic fields -----
     def u_star(self, x, y, t):
@@ -49,35 +64,56 @@ class Helmholtz2D(BaseExperiment):
 
     # ----- sampling -----
     def sample_batch(self, n_f, n_b, n_0):
-        # Collocation in interior (x,y,t)
-        X_f_xy = self.rect.sample(n_f)  # [n_f,2]
-        t_f = torch.rand(n_f, 1, device=self.rect.device) * (self.t1 - self.t0) + self.t0
-        X_f = torch.cat([X_f_xy, t_f], dim=1)
+        if self.sampling_mode == "random":
+            X_f_xy = self.rect.sample(n_f)  # [n_f,2]
+            t_f = torch.rand(n_f, 1, device=self.device) * (self.t1 - self.t0) + self.t0
+            X_f = torch.cat([X_f_xy, t_f], dim=1)
 
-        # Spatial boundary on all 4 edges across random t
-        nb = max(1, n_b // 4)
-        xa, xb, ya, yb = self.rect.xa, self.rect.xb, self.rect.ya, self.rect.yb
-        t_b = torch.rand(4 * nb, 1, device=self.rect.device) * (self.t1 - self.t0) + self.t0
+            # Spatial boundary on all 4 edges across random t
+            xa, xb, ya, yb = self.rect.xa, self.rect.xb, self.rect.ya, self.rect.yb
+            t_b = torch.rand(4 * n_b, 1, device=self.device) * (self.t1 - self.t0) + self.t0
 
-        y = torch.rand(nb, 1, device=self.rect.device) * (yb - ya) + ya
-        x = torch.rand(nb, 1, device=self.rect.device) * (xb - xa) + xa
+            y = torch.rand(n_b, 1, device=self.device) * (yb - ya) + ya
+            x = torch.rand(n_b, 1, device=self.device) * (xb - xa) + xa
 
-        top    = torch.cat([x, torch.full_like(x, yb)], 1)
-        bottom = torch.cat([x, torch.full_like(x, ya)], 1)
-        left   = torch.cat([torch.full_like(y, xa), y], 1)
-        right  = torch.cat([torch.full_like(y, xb), y], 1)
+            top    = torch.cat([x, torch.full_like(x, yb)], 1)
+            bottom = torch.cat([x, torch.full_like(x, ya)], 1)
+            left   = torch.cat([torch.full_like(y, xa), y], 1)
+            right  = torch.cat([torch.full_like(y, xb), y], 1)
 
-        X_b_spatial = torch.cat([top, bottom, left, right], dim=0)
-        X_b = torch.cat([X_b_spatial, t_b], dim=1)  # [4*nb, 3]
-        u_b = self.u_star(X_b[:, 0:1], X_b[:, 1:2], X_b[:, 2:3])
+            X_b_spatial = torch.cat([top, bottom, left, right], dim=0)
+            X_b = torch.cat([X_b_spatial, t_b], dim=1)  # [4*n_b, 3]
+            u_b = self.u_star(X_b[:, 0:1], X_b[:, 1:2], X_b[:, 2:3])
 
-        # Initial condition at t = t0
-        x0y0 = self.rect.sample(n_0)
-        t0 = torch.full((n_0, 1), self.t0, device=self.rect.device)
-        X_0 = torch.cat([x0y0, t0], dim=1)
-        u0 = self.u_star(X_0[:, 0:1], X_0[:, 1:2], X_0[:, 2:3])
+            # Initial condition at t = t0
+            x0y0 = self.rect.sample(n_0)
+            t0 = torch.full((n_0, 1), self.t0, device=self.device)
+            X_0 = torch.cat([x0y0, t0], dim=1)
+            u0 = self.u_star(X_0[:, 0:1], X_0[:, 1:2], X_0[:, 2:3])
 
-        return {"X_f": X_f, "X_b": X_b, "u_b": u_b, "X_0": X_0, "u0": u0}
+            return {"X_f": X_f, "X_b": X_b, "u_b": u_b, "X_0": X_0, "u0": u0}
+
+        elif self.sampling_mode == "grid":
+            M, T = self._XY.size(0), self._T.size(0)
+            
+            # interior
+            idx_xy = torch.randint(0, M, (n_f,), device=self.device)
+            idx_t  = torch.randint(0, T, (n_f,), device=self.device)
+            X_f = torch.cat([self._XY[idx_xy], self._T[idx_t].unsqueeze(1)], dim=1)
+            
+            # boundary (any edge)
+            mb = self._XYb.size(0)
+            idx_b = torch.randint(0, mb, (n_b,), device=self.device)
+            idx_bt = torch.randint(0, T, (n_b,), device=self.device)
+            X_b = torch.cat([self._XYb[idx_b], self._T[idx_bt].unsqueeze(1)], dim=1)
+            u_b = self.u_star(X_b[:,0:1], X_b[:,1:2], X_b[:,2:3])
+
+            # initial (t = t0)
+            idx0 = torch.randint(0, M, (n_0,), device=self.device)
+            X_0 = torch.cat([self._XY[idx0], torch.full((n_0,1), self.t0, device=self.device)], dim=1)
+            u0 = self.u_star(X_0[:,0:1], X_0[:,1:2], X_0[:,2:3])
+
+            return {"X_f": X_f, "X_b": X_b, "u_b": u_b, "X_0": X_0, "u0": u0}
 
     # ----- losses -----
     def pde_residual_loss(self, model, batch):
@@ -146,3 +182,7 @@ class Helmholtz2D(BaseExperiment):
                 out = save_plots_2d(Xg.cpu().numpy(), Yg.cpu().numpy(), U_true, U_pred, out_dir, f"wave2d_{label}")
                 figs.update(out)
         return figs
+    
+    def make_video(self, model, grid, out_dir, fps=10, filename="evolution.mp4"):
+        os.makedirs(out_dir, exist_ok=True)
+        

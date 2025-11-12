@@ -4,3 +4,12 @@ domain:
 nu: 0.01/np.pi
 in_features: 2 # (x,t)
 out_features: 1
+
+# sampling
+sampling_mode: random # random / grid
+grid:
+  nx: 256
+  nt: 256
+batch:
+  n_f: 4096
+  n_0: 1024

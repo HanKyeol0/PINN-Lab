@@ -1,3 +1,8 @@
+# scripts/mlp/allencahn2d.sh
+
+tag: test0
+devide: cuda:0
+
 domain:
   x: [0.0, 4.0]
   y: [0.0, 4.0]
@@ -6,3 +11,14 @@ eps: 0.01
 omega: 8.0
 in_features: 3
 out_features: 1
+
+# sampling
+sampling_mode: grid # random / grid
+grid:
+  nx: 256
+  ny: 256
+  nt: 256
+batch:
+  n_f: 4096
+  n_b: 1024
+  n_0: 1024

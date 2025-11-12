@@ -21,3 +21,14 @@ lambda: auto            # "auto" -> lambda = 2*kappa*pi^2 (f=0); or set a number
 # IMPORTANT: Set input dimension to match the toggle
 in_features: 3          # set 3 when time_dependent: true
 out_features: 1
+
+# sampling
+sampling_mode: random # random / grid
+grid:
+  nx: 256
+  ny: 256
+  nt: 256
+batch:
+  n_f: 4096
+  n_b: 1024
+  n_0: 1024

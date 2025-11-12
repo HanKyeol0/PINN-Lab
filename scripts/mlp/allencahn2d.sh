@@ -1,3 +1,5 @@
+# scripts/mlp/allencahn2d.sh
+
 #!/usr/bin/env bash
 set -e
 

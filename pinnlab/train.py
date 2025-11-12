@@ -33,13 +33,23 @@ def main(args):
 
     seed_everything(base_cfg["seed"])
 
+    if exp_cfg.get("device"):
+        base_cfg["device"] = exp_cfg["device"]
     device = torch.device(base_cfg["device"] if torch.cuda.is_available() else "cpu")
+    torch.cuda.reset_peak_memory_stats(device)
+    
     exp = get_experiment(args.experiment_name)(exp_cfg, device)
     model = get_model(args.model_name)(model_cfg).to(device)
-
+    
     # Logging dir
-    ts = time.strftime("%Y%m%d-%H%M%S")
-    out_dir = os.path.join(base_cfg["log"]["out_dir"], f"{args.experiment_name}_{args.model_name}_{ts}")
+    tag = exp_cfg.get("tag", None)
+    if tag:
+        file_name = f"{args.experiment_name}_{args.model_name}_{tag}"
+    else:
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        file_name = f"{args.experiment_name}_{args.model_name}_{ts}"
+    
+    out_dir = os.path.join(base_cfg["log"]["out_dir"], args.experiment_name, file_name)
     os.makedirs(out_dir, exist_ok=True)
 
     _save_yaml(os.path.join(out_dir, "config.yaml"), {
@@ -79,27 +89,28 @@ def main(args):
                 writer = csv.writer(f)
                 writer.writerow(["step"] + weights_terms)
 
-    global_step = 0
-
     # WandB
     if base_cfg["log"]["wandb"]["enabled"]:
         wandb.login(key=os.getenv('WANDB_API_KEY'))
         wandb.init(project = base_cfg["log"]["wandb"]["project"],
-                   name = f"{args.experiment_name}_{args.model_name}_{ts}")
+                   name = file_name)
         run = setup_wandb(base_cfg["log"]["wandb"], args, out_dir, config={
             "base": base_cfg, "model": model_cfg, "experiment": exp_cfg
         })
 
     # gradient flow logger
-    gf = GradientFlowLogger(
-        model, out_dir,
-        enable=base_cfg.get("gradflow", {}).get("enabled", True),
-        every=int(base_cfg.get("gradflow", {}).get("every", 1000)),
-        store_vectors=bool(base_cfg.get("gradflow", {}).get("store_vectors", False)),
-        max_keep_per_layer=int(base_cfg.get("gradflow", {}).get("max_keep", 20)),
-        wandb_hist=bool(base_cfg.get("gradflow", {}).get("wandb_hist", False)),
-        plot_cfg=base_cfg.get("gradflow", {}).get("plot", {})
-    )
+    use_gradflow = base_cfg["gradflow"]["enabled"]
+    if use_gradflow:
+        gf = GradientFlowLogger(
+            model, out_dir,
+            enable=base_cfg.get("gradflow", {}).get("enabled", True),
+            every=int(base_cfg.get("gradflow", {}).get("every", 1000)),
+            store_vectors=bool(base_cfg.get("gradflow", {}).get("store_vectors", False)),
+            max_keep_per_layer=int(base_cfg.get("gradflow", {}).get("max_keep", 20)),
+            wandb_hist=bool(base_cfg.get("gradflow", {}).get("wandb_hist", False)),
+            plot_cfg=base_cfg.get("gradflow", {}).get("plot", {})
+        )
+        gf_stop = base_cfg["gradflow"]["stop_at"]
 
     epochs = base_cfg["train"]["epochs"]
     eval_every = int(base_cfg.get("eval").get("every", 100))
@@ -110,7 +121,6 @@ def main(args):
     best_state = None
     best_metric = float("inf")
 
-    # Training loop
     w_res = base_cfg["train"]["loss_weights"]["res"]
     w_bc = base_cfg["train"]["loss_weights"]["bc"]
     w_ic = base_cfg["train"]["loss_weights"]["ic"]
@@ -118,6 +128,10 @@ def main(args):
     n_f = exp_cfg.get("batch", {}).get("n_f", base_cfg["train"]["batch"]["n_f"])
     n_b = exp_cfg.get("batch", {}).get("n_b", base_cfg["train"]["batch"]["n_b"])
     n_0 = exp_cfg.get("batch", {}).get("n_0", base_cfg["train"]["batch"]["n_0"])
+    
+    # Make video
+    enable_video = exp_cfg.get("video", {}).get("enabled", False)
+    make_video_every = exp_cfg.get("video", {}).get("every", eval_every)
 
     use_tty = sys.stdout.isatty()
     pbar = trange(
@@ -128,8 +142,11 @@ def main(args):
         leave=False,          # don't leave old bars behind
         disable=not use_tty,  # if output is piped, avoid multiline spam
     )
-    gf_stop = base_cfg["gradflow"]["stop_at"]
 
+    # Training loop
+    print("training started")
+    training_start_time = time.time()
+    global_step = 0
     for ep in pbar:
         model.train()
         batch = exp.sample_batch(n_f=n_f, n_b=n_b, n_0=n_0)
@@ -142,11 +159,12 @@ def main(args):
         loss_bc_s = loss_bc.mean() if torch.is_tensor(loss_bc) and loss_bc.dim() > 0 else loss_bc
         loss_ic_s = loss_ic.mean() if torch.is_tensor(loss_ic) and loss_ic.dim() > 0 else loss_ic
 
-        if ep <= gf_stop:
-            gf.collect({"res": loss_res_s, "bc": loss_bc_s, "ic": loss_ic_s}, step=global_step)
+        if use_gradflow and global_step % gf.every == 0:
+            if ep <= gf_stop:
+                gf.collect({"res": loss_res_s, "bc": loss_bc_s, "ic": loss_ic_s}, step=global_step)
 
         losses = {
-            "res": loss_res_s,     # PDE residual term
+            "res": loss_res,     # PDE residual term
             **({"bc": loss_bc} if "loss_bc" in locals() else {}),
             **({"ic": loss_ic} if "loss_ic" in locals() else {}),
             # **({"data": loss_data} if "loss_data" in locals() else {}),
@@ -170,33 +188,38 @@ def main(args):
         total_loss.backward()
         optimizer.step()
 
+        # Log
+        it_per_sec = pbar.format_dict.get("rate", None)
+        elapsed_s  = pbar.format_dict.get("elapsed", None)
+        gpu_now = {
+            "gpu/mem_alloc_mb": float(torch.cuda.memory_allocated(device)) / (1024**2),
+            "gpu/mem_reserved_mb": float(torch.cuda.memory_reserved(device)) / (1024**2),
+        }
+        log_payload = {
+            "loss/total": float(total_loss.detach().cpu()),
+            "loss/res": float(loss_res_s.detach().cpu()),
+            "loss/bc": float(loss_bc_s.detach().cpu()),
+            "loss/ic": float(loss_ic_s.detach().cpu()),
+            "lr": optimizer.param_groups[0]["lr"],
+            "epoch": ep,
+            "perf/it_per_sec_tqdm": it_per_sec if it_per_sec is not None else 0.0,
+            "perf/elapsed_sec": elapsed_s if elapsed_s is not None else 0.0,
+            **gpu_now,
+        }
+        wandb_log(log_payload, commit=True)
+        pbar.set_postfix({k: f"{v:.3e}" for k,v in log_payload.items() if "loss" in k})
         global_step += 1
 
-        # Log
-        log_dict = {
-            "loss/total": total_loss.item(),
-            "loss/res": loss_res.item(),
-            "loss/bc": loss_bc.item(),
-            "loss/ic": loss_ic.item(),
-            "lr": optimizer.param_groups[0]["lr"],
-            "epoch": ep
-        }
-        wandb_log(log_dict, step=global_step, commit=False)
-        pbar.set_postfix({k: f"{v:.3e}" for k,v in log_dict.items() if "loss" in k})
-        log_payload = {"loss/total": float(total_loss.detach().cpu())}
-        log_payload.update(w_dict)
-        log_payload.update(aux)        # e.g., sigma values for uncertainty scheme
-        for k, v in losses.items():
-            log_payload[f"loss/{k}"] = float(v.detach().cpu())
-        wandb_log(log_payload, step=global_step, commit=True)
-
         # Simple validation metric (relative L2 on a fixed grid)
-        best_path = os.path.join(out_dir, "best.pt")
-        if ep % eval_every == 0 or ep == epochs-1:
+        if (ep % eval_every == 0 or ep == epochs-1) and (ep > 0):
+            print(f"evaluating.. ep={ep}")
+            evaluation_start_time = time.time()
+            
             with torch.no_grad():
                 rel_l2 = exp.relative_l2_on_grid(model, base_cfg["eval"]["grid"])
-            wandb_log({"eval/rel_l2": rel_l2, "epoch": ep}, step=global_step)
+            wandb_log({"eval/rel_l2": rel_l2, "epoch": ep})
 
+            best_path = os.path.join(out_dir, "best.pt")
             if rel_l2 < (best_metric - es_cfg.get("min_delta", 0.0)):
                 best_metric = rel_l2
                 best_state = {k: v.clone() for k,v in model.state_dict().items()}
@@ -205,17 +228,50 @@ def main(args):
             if early and early.step(rel_l2):
                 print(f"\n[EarlyStopping] Stopping at epoch {ep}. Best rel_l2={best_metric:.3e}")
                 break
+            
+            evaluation_end_time = time.time()
+            print(f"evaluation finished: {evaluation_end_time - evaluation_start_time:.2f} sec")
+            
+        if enable_video and (ep % make_video_every == 0 and ep > 0):
+            vid_grid = exp_cfg.get("video", {}).get("grid", base_cfg["eval"]["grid"])
+            fps      = exp_cfg.get("video", {}).get("fps", 10)
+            out_fmt  = exp_cfg.get("video", {}).get("format", "mp4")  # "mp4" or "gif"
+            vid_path = exp.make_video(
+                model, vid_grid, out_dir, fps=fps,
+                filename=f"eval_ep{ep}.{out_fmt}"
+            )
+
+    training_end_time = time.time()
+    
+    final_perf = {
+        "perf/total_time_sec": training_end_time - training_start_time,
+        "gpu/peak_mem_alloc_mb": float(torch.cuda.max_memory_allocated(device)) / (1024**2),
+        "gpu/peak_mem_reserved_mb": float(torch.cuda.max_memory_reserved(device)) / (1024**2),
+    }
+
+    if enable_video:
+        vid_grid = exp_cfg.get("video", {}).get("grid", base_cfg["eval"]["grid"])
+        fps      = exp_cfg.get("video", {}).get("fps", 10)
+        out_fmt  = exp_cfg.get("video", {}).get("format", "mp4")  # "mp4" or "gif"
+        vid_path = exp.make_video(
+            model, vid_grid, out_dir,
+            fps=fps, filename=f"final_evolution.{out_fmt}"
+        )
+        wandb_log({"video/evolution": wandb.Video(vid_path, format=out_fmt)})
+    
+    wandb_log(final_perf)
 
     weights_png = os.path.join(out_dir, "loss_weights.png")
     plot_weights_over_time(weights_csv, weights_png)
     print(f"[weights] saved: {weights_csv}")
     print(f"[weights] plot : {weights_png}")
 
-    gf.save()
-    if gf.plot_enabled:
-        saved = gf.save_plots()
-        for p in saved:
-            print(f"[gradflow] saved plot: {p}")
+    if use_gradflow:
+        gf.save()
+        if gf.plot_enabled:
+            saved = gf.save_plots()
+            for p in saved:
+                print(f"[gradflow] saved plot: {p}")
 
     # Restore best
     if best_state:
@@ -225,7 +281,7 @@ def main(args):
     model.eval()
     figs = exp.plot_final(model, base_cfg["eval"]["grid"], out_dir)
     for name, path in figs.items():
-        wandb_log({f"fig/{name}": wandb.Image(path)}, step=global_step)
+        wandb_log({f"fig/{name}": wandb.Image(path)})
 
     wandb_finish()
     print(f"Artifacts saved to: {out_dir}")

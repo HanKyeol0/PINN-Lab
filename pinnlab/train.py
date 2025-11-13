@@ -212,9 +212,6 @@ def main(args):
 
         # Simple validation metric (relative L2 on a fixed grid)
         if (ep % eval_every == 0 or ep == epochs-1) and (ep > 0):
-            print(f"evaluating.. ep={ep}")
-            evaluation_start_time = time.time()
-            
             with torch.no_grad():
                 rel_l2 = exp.relative_l2_on_grid(model, base_cfg["eval"]["grid"])
             wandb_log({"eval/rel_l2": rel_l2, "epoch": ep})
@@ -228,9 +225,6 @@ def main(args):
             if early and early.step(rel_l2):
                 print(f"\n[EarlyStopping] Stopping at epoch {ep}. Best rel_l2={best_metric:.3e}")
                 break
-            
-            evaluation_end_time = time.time()
-            print(f"evaluation finished: {evaluation_end_time - evaluation_start_time:.2f} sec")
             
         if enable_video and (ep % make_video_every == 0 and ep > 0):
             vid_grid = exp_cfg.get("video", {}).get("grid", base_cfg["eval"]["grid"])

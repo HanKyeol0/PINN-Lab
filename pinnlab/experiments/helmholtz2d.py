@@ -1,5 +1,7 @@
-import math, os, numpy as np
+import math, os, numpy as np, io
 import torch
+import matplotlib.pyplot as plt
+import imageio.v2 as imageio
 
 from pinnlab.experiments.base import BaseExperiment, make_leaf, grad_sum
 from pinnlab.data.geometries import Rectangle, linspace_2d
@@ -184,5 +186,107 @@ class Helmholtz2D(BaseExperiment):
         return figs
     
     def make_video(self, model, grid, out_dir, fps=10, filename="evolution.mp4"):
+        """
+        Make a video over t ∈ [t0, t1] comparing:
+          (1) true solution u*(x,y,t),
+          (2) model prediction u(x,y,t),
+          (3) absolute error |u* - u|.
+        Frames share fixed color scales across time for visual fairness.
+
+        Args:
+            model: trained model
+            grid: dict with keys {"nx","ny","nt"} (same structure as eval grid)
+            out_dir: directory to save the video into
+            fps: frames per second
+            filename: output name with extension .mp4 or .gif
+        Returns:
+            Full path to the saved video.
+        """
+
         os.makedirs(out_dir, exist_ok=True)
-        
+        path = os.path.join(out_dir, filename)
+
+        nx, ny, nt = int(grid["nx"]), int(grid["ny"]), int(grid["nt"])
+        # Build spatial grid once
+        Xg, Yg = linspace_2d(
+            self.rect.xa, self.rect.xb,
+            self.rect.ya, self.rect.yb,
+            nx, ny, self.rect.device
+        )
+        ts = torch.linspace(self.t0, self.t1, nt, device=self.rect.device)
+
+        # Precompute color limits for consistent scales across time
+        vmin, vmax = None, None
+        err_max = 0.0
+
+        model.eval()
+        with torch.no_grad():
+            for tval in ts:
+                T = torch.full_like(Xg, tval)
+                XYT = torch.stack([Xg.reshape(-1), Yg.reshape(-1), T.reshape(-1)], dim=1)
+                U_pred = model(XYT).reshape(nx, ny)          # [nx, ny]
+                U_true = self.u_star(Xg, Yg, T)              # [nx, ny]
+
+                umin = min(U_true.min().item(), U_pred.min().item())
+                umax = max(U_true.max().item(), U_pred.max().item())
+                vmin = umin if vmin is None else min(vmin, umin)
+                vmax = umax if vmax is None else max(vmax, umax)
+
+                err_max = max(err_max, (U_true - U_pred).abs().max().item())
+
+        # Render frames
+        frames = []
+        extent = [float(self.rect.xa), float(self.rect.xb),
+                  float(self.rect.ya), float(self.rect.yb)]
+
+        with torch.no_grad():
+            for i, tval in enumerate(ts):
+                T = torch.full_like(Xg, tval)
+                XYT = torch.stack([Xg.reshape(-1), Yg.reshape(-1), T.reshape(-1)], dim=1)
+                U_pred = model(XYT).reshape(nx, ny).cpu().numpy()
+                U_true = self.u_star(Xg, Yg, T).cpu().numpy()
+                U_err  = np.abs(U_true - U_pred)
+
+                fig = plt.figure(figsize=(12, 3.6), dpi=120)
+                plt.suptitle(f"t = {float(tval):.5f}")
+
+                ax1 = plt.subplot(1, 3, 1)
+                im1 = ax1.imshow(U_true.T, origin="lower", extent=extent, vmin=vmin, vmax=vmax, aspect="auto")
+                ax1.set_title("True")
+                ax1.set_xlabel("x"); ax1.set_ylabel("y")
+                fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
+
+                ax2 = plt.subplot(1, 3, 2)
+                im2 = ax2.imshow(U_pred.T, origin="lower", extent=extent, vmin=vmin, vmax=vmax, aspect="auto")
+                ax2.set_title("Pred")
+                ax2.set_xlabel("x"); ax2.set_ylabel("y")
+                fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
+
+                ax3 = plt.subplot(1, 3, 3)
+                im3 = ax3.imshow(U_err.T, origin="lower", extent=extent, vmin=0.0, vmax=err_max, aspect="auto")
+                ax3.set_title("|Error|")
+                ax3.set_xlabel("x"); ax3.set_ylabel("y")
+                fig.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+
+                # Convert figure to RGB frame (no file I/O for intermediates)
+                fig.canvas.draw()
+                w, h = fig.canvas.get_width_height()
+                buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+                frame = buf.reshape(h, w, 3)
+                frames.append(frame.copy())
+                plt.close(fig)
+
+        # Write video (mp4 or gif)
+        ext = os.path.splitext(filename)[1].lower()
+        if ext == ".gif":
+            imageio.mimsave(path, frames, fps=fps)
+        elif ext == ".mp4":
+            # imageio will use ffmpeg if available; otherwise users can switch to .gif
+            writer = imageio.get_writer(path, fps=fps, codec="libx264", quality=7)
+            for fr in frames:
+                writer.append_data(fr)
+            writer.close()
+        else:
+            raise ValueError(f"Unsupported video format: {ext}")
+
+        return path

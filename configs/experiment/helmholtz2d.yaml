@@ -17,9 +17,9 @@ time_dependent: true
 # sampling
 sampling_mode: grid # random / grid
 grid:
-  nx: 256
-  ny: 256
-  nt: 256
+  nx: 128
+  ny: 128
+  nt: 64
 batch:
   n_f: 4096
   n_b: 1024
@@ -30,8 +30,8 @@ video:
   enabled: true
   every: 10000
   grid:
-    nx: 256
-    ny: 256
-    nt: 256
+    nx: 128
+    ny: 128
+    nt: 64
   fps: 10
   format: mp4

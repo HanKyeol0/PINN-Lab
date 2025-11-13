@@ -1,2 +1,5 @@
+# apt-get update && apt-get install -y tmux
+
 wandb
-imageio.v2
+imageio
+imageio-ffmpeg

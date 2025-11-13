@@ -181,3 +181,98 @@ class NavierStokes2D(BaseExperiment):
                 figs.update(save_plots_2d(Xg.cpu().numpy(), Yg.cpu().numpy(), V_true, V_pred, out_dir, f"ns2d_v_{label}"))
                 figs.update(save_plots_2d(Xg.cpu().numpy(), Yg.cpu().numpy(), P_true, P_pred, out_dir, f"ns2d_p_{label}"))
         return figs
+
+    def make_video(self, model, grid, out_dir, fps=10, filename="evolution.mp4"):
+        """
+        Make a video showing the temporal evolution of (u, v, p) on the 2D domain.
+
+        - grid: dict with keys {"nx", "ny", "nt"}
+        - Produces a video with 2x3 panels:
+            top row:  u_pred, v_pred, p_pred
+            bottom:   u_true, v_true, p_true
+        """
+        os.makedirs(out_dir, exist_ok=True)
+        path = os.path.join(out_dir, filename)
+
+        nx = int(grid.get("nx", 64))
+        ny = int(grid.get("ny", 64))
+        nt = int(grid.get("nt", 50))
+
+        device = self.rect.device
+        Xg, Yg = linspace_2d(self.rect.xa, self.rect.xb,
+                             self.rect.ya, self.rect.yb,
+                             nx, ny, device)
+        ts = torch.linspace(self.t0, self.t1, nt, device=device)
+
+        # Choose writer depending on extension
+        ext = os.path.splitext(filename)[1].lower()
+        if ext == ".gif":
+            writer = imageio.get_writer(path, mode="I", duration=1.0 / fps)
+        else:
+            # mp4 (default) – codec arg may require ffmpeg/libx264 in the system
+            writer = imageio.get_writer(path, fps=fps, codec="libx264", quality=7)
+
+        with writer:
+            for ti, tval in enumerate(ts):
+                T = torch.full_like(Xg, tval)
+
+                # Build (x,y,t) query points
+                XYT = torch.stack(
+                    [Xg.reshape(-1), Yg.reshape(-1), T.reshape(-1)], dim=1
+                )
+
+                with torch.no_grad():
+                    out = model(XYT).reshape(nx, ny, 3).cpu().numpy()
+                    U_pred = out[:, :, 0]
+                    V_pred = out[:, :, 1]
+                    P_pred = out[:, :, 2]
+
+                    U_true = self.u_star(Xg, Yg, T).cpu().numpy()
+                    V_true = self.v_star(Xg, Yg, T).cpu().numpy()
+                    P_true = self.p_star(Xg, Yg, T).cpu().numpy()
+
+                # 2x3 panel: (u,v,p) for pred (top) and true (bottom)
+                fig, axes = plt.subplots(2, 3, figsize=(12, 6))
+                fields_pred = [U_pred, V_pred, P_pred]
+                fields_true = [U_true, V_true, P_true]
+                titles = ["u", "v", "p"]
+
+                for col in range(3):
+                    # predicted
+                    ax = axes[0, col]
+                    im = ax.imshow(
+                        fields_pred[col],
+                        origin="lower",
+                        extent=[self.rect.xa, self.rect.xb,
+                                self.rect.ya, self.rect.yb],
+                    )
+                    ax.set_title(f"pred {titles[col]}")
+                    ax.set_xlabel("x")
+                    ax.set_ylabel("y")
+                    fig.colorbar(im, ax=ax, shrink=0.7)
+
+                    # true
+                    ax = axes[1, col]
+                    im = ax.imshow(
+                        fields_true[col],
+                        origin="lower",
+                        extent=[self.rect.xa, self.rect.xb,
+                                self.rect.ya, self.rect.yb],
+                    )
+                    ax.set_title(f"true {titles[col]}")
+                    ax.set_xlabel("x")
+                    ax.set_ylabel("y")
+                    fig.colorbar(im, ax=ax, shrink=0.7)
+
+                fig.suptitle(f"Navier–Stokes 2D  t = {float(tval):.3f}", y=0.98)
+                fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+                # Convert figure to RGB array for imageio
+                fig.canvas.draw()
+                frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+                frame = frame.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+                plt.close(fig)
+
+                writer.append_data(frame)
+
+        return path

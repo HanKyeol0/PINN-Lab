@@ -1,7 +1,7 @@
 # scripts/mlp/helmholtz2d.sh
 
 tag: test0
-devide: cuda:0
+device: cuda
 
 domain:
   x: [-2.0, 2.0]

@@ -1,3 +1,8 @@
+# scripts/mlp/navierstokes2d.sh
+
+tag: test0
+device: cuda
+
 # 2D incompressible Navier–Stokes (Taylor–Green vortex), periodic in x,y
 time_dependent: true
 
@@ -22,12 +27,23 @@ in_features: 3   # (x,y,t)
 out_features: 3  # (u,v,p)
 
 # sampling
-sampling_mode: random # random / grid
+sampling_mode: grid # random / grid
 grid:
-  nx: 256
-  ny: 256
-  nt: 256
+  nx: 128
+  ny: 128
+  nt: 64
 batch:
   n_f: 4096
   n_b: 1024
   n_0: 1024
+
+# video
+video:
+  enabled: true
+  every: 10000
+  grid:
+    nx: 128
+    ny: 128
+    nt: 64
+  fps: 10
+  format: mp4

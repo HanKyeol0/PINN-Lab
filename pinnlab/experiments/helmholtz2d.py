@@ -124,7 +124,7 @@ class Helmholtz2D(BaseExperiment):
         self.noise_model = get_noise(kind, f, pars=0)
 
         # In PINN-EBM, sample() often expects a shape list (e.g. [N])
-        eps = self.noise_model.sample([n]).to(self.device).view(-1, 1)  # [n, 1]
+        eps = self.noise_model.sample(n).to(self.device).view(-1, 1)  # [n, 1]
 
         y_noisy = u_clean + eps
 
@@ -346,7 +346,7 @@ class Helmholtz2D(BaseExperiment):
                 U_true = self.u_star(Xg, Yg, T)        # [nx, ny]
 
                 if has_noise_model:
-                    eps = self.noise_model.sample([nx * ny]).to(self.rect.device)
+                    eps = self.noise_model.sample(nx * ny).to(self.rect.device)
                     eps = eps.view(nx, ny)
                     U_noisy = U_true + eps
                 else:
@@ -378,7 +378,7 @@ class Helmholtz2D(BaseExperiment):
                 U_true = self.u_star(Xg, Yg, T).cpu().numpy()
 
                 if has_noise_model:
-                    eps = self.noise_model.sample([nx * ny]).to(self.rect.device)
+                    eps = self.noise_model.sample(nx * ny).to(self.rect.device)
                     eps = eps.view(nx, ny).cpu().numpy()
                     U_noisy = U_true + eps
                 else:
@@ -522,7 +522,7 @@ class Helmholtz2D(BaseExperiment):
                 U_pred = model(XYT).reshape(nx, ny)              # [nx, ny]
 
                 # Sample true noise on full grid (whole domain)
-                eps_true_flat = self.noise_model.sample([nx * ny]).to(self.rect.device)
+                eps_true_flat = self.noise_model.sample(nx * ny).to(self.rect.device)
                 eps_true = eps_true_flat.view(nx, ny)            # [nx, ny]
 
                 # Noisy observations and residuals
@@ -546,18 +546,23 @@ class Helmholtz2D(BaseExperiment):
                 # True noise pdf
                 pdf_true = None
                 if hasattr(self.noise_model, "pdf"):
-                    pdf_true = self.noise_model.pdf(r_torch).detach().cpu().numpy()
-
+                    r_cpu = torch.from_numpy(r_grid).float()  # CPU tensor
+                    pdf_true_tensor = self.noise_model.pdf(r_cpu)  # all CPU ops inside noise.py
+                    if isinstance(pdf_true_tensor, torch.Tensor):
+                        pdf_true = pdf_true_tensor.detach().cpu().numpy()
+                    else:
+                        pdf_true = np.asarray(pdf_true_tensor)
+                        
                 # EBM pdf (from log q_theta)
                 with torch.no_grad():
                     log_q = self.ebm(r_torch.unsqueeze(-1)).squeeze(-1)  # [200]
-                    log_q = log_q - log_q.max()  # shift for numerical stability
+                    log_q = log_q# - log_q.max()  # shift for numerical stability
                     pdf_unn = torch.exp(log_q)   # unnormalized
                     Z = torch.trapezoid(pdf_unn, r_torch)
                     pdf_ebm = (pdf_unn / (Z + 1e-12)).cpu().numpy()
 
                 # ---- Build figure ----
-                fig, axes = plt.subplots(2, 2, figsize=(11, 7), dpi=120)
+                fig, axes = plt.subplots(2, 2, figsize=(12, 12), dpi=120)
                 fig.suptitle(f"Noise distributions at t = {float(tval):.4f}")
 
                 # [0,0] True noise field ε*(x,y,t)

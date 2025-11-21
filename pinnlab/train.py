@@ -107,8 +107,6 @@ def main(args):
     best_metric = float("inf")
 
     w_res = base_cfg["train"]["loss_weights"]["res"]
-    w_bc = base_cfg["train"]["loss_weights"]["bc"]
-    w_ic = base_cfg["train"]["loss_weights"]["ic"]
     w_data = base_cfg["train"]["loss_weights"]["data"]
 
     n_f = exp_cfg.get("batch", {}).get("n_f", base_cfg["train"]["batch"]["n_f"])
@@ -138,27 +136,20 @@ def main(args):
         batch = exp.sample_batch(n_f=n_f, n_b=n_b, n_0=n_0)
 
         loss_res = exp.pde_residual_loss(model, batch).mean() if batch.get("X_f") is not None else torch.tensor(0., device=device)
-        # loss_bc = exp.boundary_loss(model, batch).mean()      if batch.get("X_b") is not None else torch.tensor(0., device=device)
-        # loss_ic = exp.initial_loss(model, batch).mean()       if batch.get("X_0") is not None else torch.tensor(0., device=device)
         loss_data = exp.data_loss(model, batch).mean()        if batch.get("X_d") is not None else torch.tensor(0., device=device)
         
         loss_res_s = loss_res.mean() if torch.is_tensor(loss_res) and loss_res.dim() > 0 else loss_res # scalar
-        # loss_bc_s = loss_bc.mean() if torch.is_tensor(loss_bc) and loss_bc.dim() > 0 else loss_bc
-        # loss_ic_s = loss_ic.mean() if torch.is_tensor(loss_ic) and loss_ic.dim() > 0 else loss_ic
         loss_data_s = loss_data.mean() if torch.is_tensor(loss_data) and loss_data.dim() > 0 else loss_data
 
         losses = {
             "res": loss_res,     # PDE residual term
-            # **({"bc": loss_bc} if "loss_bc" in locals() else {}),
-            # **({"ic": loss_ic} if "loss_ic" in locals() else {}),
             **({"data": loss_data} if "loss_data" in locals() else {}),
         }
 
         if not use_loss_balancer:
             total_loss = w_res*loss_res + w_data*loss_data
-            # total_loss = w_res*loss_res + w_bc*loss_bc + w_ic*loss_ic + w_data*loss_data
-            s = (w_res + w_bc + w_ic + w_data) or 1.0
-            w_now = {"res": w_res/s, "bc": w_bc/s, "ic": w_ic/s, "data": w_data/s}
+            s = (w_res + w_data) or 1.0
+            w_now = {"res": w_res/s, "data": w_data/s}
         else:
             total_loss, w_dict, aux = balancer(losses, step=global_step, model=model)
             w_now = {k.split("/", 1)[1]: float(v) for k, v in w_dict.items()}
@@ -183,8 +174,6 @@ def main(args):
         log_payload = {
             "loss/total": float(total_loss.detach().cpu()),
             "loss/res": float(loss_res_s.detach().cpu()),
-            # "loss/bc": float(loss_bc_s.detach().cpu()),
-            # "loss/ic": float(loss_ic_s.detach().cpu()),
             "loss/data": float(loss_data_s.detach().cpu()),
             "lr": optimizer.param_groups[0]["lr"],
             "epoch": ep,

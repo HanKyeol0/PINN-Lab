@@ -1,7 +1,7 @@
 seed: 40
 device: "cuda"            # "cuda" or "cpu"
 train:
-  epochs: 20000
+  epochs: 50000
   batch:
     n_f: 4096             # collocation points
     n_b: 1024             # boundary points
@@ -10,7 +10,7 @@ train:
     name: adam
     lr: 1.0e-3
   early_stopping:
-    enabled: true
+    enabled: false
     patience: 20000
     min_delta: 1.0e-5
   loss_weights:

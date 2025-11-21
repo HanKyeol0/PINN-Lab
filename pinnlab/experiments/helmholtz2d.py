@@ -5,6 +5,8 @@ import imageio.v2 as imageio
 
 from pinnlab.experiments.base import BaseExperiment, make_leaf, grad_sum
 from pinnlab.data.geometries import Rectangle, linspace_2d
+from pinnlab.data.noise import get_noise
+from pinnlab.utils.ebm import EBM
 
 class Helmholtz2D(BaseExperiment):
     """
@@ -54,6 +56,37 @@ class Helmholtz2D(BaseExperiment):
             mask_b = XY[:,0].eq(xa) | XY[:,0].eq(xb) | XY[:,1].eq(ya) | XY[:,1].eq(yb)
             self._XYb = XY[mask_b]  # [nb, 2]
 
+        noise_cfg = cfg.get("noise", None)
+        self.use_data = bool(noise_cfg.get("enabled", False))
+        self.noise_cfg = noise_cfg
+        self.n_data_total = int(noise_cfg.get("n_train", 0))
+        self.n_data_batch = int(
+            noise_cfg.get("batch_size", 1000)
+        )
+        
+        self.X_data = None
+        self.y_data = None
+        self.y_clean = None
+        self.noise_model = None
+        
+        if self.use_data and self.n_data_total > 0:
+            print(f"Initializing noisy data with {self.n_data_total} points.")
+            self._init_noisy_dataset()
+
+        ebm_cfg = cfg.get("ebm", {}) or {}
+        self.use_ebm = bool(ebm_cfg.get("enabled", False))
+        if self.use_ebm:
+            self.ebm = EBM(
+                hidden_dim=ebm_cfg.get("hidden_dim", 32),
+                depth=ebm_cfg.get("depth", 3),
+                num_grid=ebm_cfg.get("num_grid", 256),
+                max_range_factor=ebm_cfg.get("max_range_factor", 2.5),
+                lr=ebm_cfg.get("lr", 1e-3),
+                device=device,
+            )
+        else:
+            self.ebm = None
+
     # ----- analytic fields -----
     def u_star(self, x, y, t):
         return torch.sin(math.pi * x) * torch.sin(math.pi * y) * torch.cos(self.omega * t)
@@ -63,6 +96,41 @@ class Helmholtz2D(BaseExperiment):
         # f = (-ω^2 + c^2*2π^2) u*, so residual == 0 for the chosen u*.
         coeff = (-self.omega ** 2 + (self.c ** 2) * (2.0 * math.pi ** 2))
         return coeff * self.u_star(x, y, t)
+    
+    def _init_noisy_dataset(self):
+        """
+        Generate a fixed set of noisy measurements:
+            X_data ~ Uniform(domain x time)
+            y_clean = u_star(X_data)
+            y_data  = y_clean + epsilon,     epsilon ~ noise distribution (from PINN-EBM)
+        """
+        kind = self.noise_cfg.get("kind", "3G")     # 'G', 'u', '3G', ...
+        n = self.n_data_total
+
+        # Sample input locations
+        XY = self.rect.sample(n)  # [n, 2] in (x, y)
+        t = torch.rand(n, 1, device=self.device) * (self.t1 - self.t0) + self.t0
+        X = torch.cat([XY, t], dim=1)              # [n, 3]
+
+        with torch.no_grad():
+            u_clean = self.u_star(X[:, 0:1], X[:, 1:2], X[:, 2:3])  # [n, 1]
+
+        # Determine noise scale "f" as in PINN-EBM: a factor times average magnitude of u*
+        base_scale = float(self.noise_cfg.get("scale", 0.1))  # relative to mean |u|
+        mean_level = float(u_clean.abs().mean().detach().cpu())
+        f = base_scale * (mean_level if mean_level > 0 else 1.0)
+
+        # Build noise distribution; this uses the PINN-EBM function
+        self.noise_model = get_noise(kind, f, pars=0)
+
+        # In PINN-EBM, sample() often expects a shape list (e.g. [N])
+        eps = self.noise_model.sample([n]).to(self.device).view(-1, 1)  # [n, 1]
+
+        y_noisy = u_clean + eps
+
+        self.X_data = X
+        self.y_clean = u_clean
+        self.y_data = y_noisy
 
     # ----- sampling -----
     def sample_batch(self, n_f, n_b, n_0):
@@ -93,7 +161,7 @@ class Helmholtz2D(BaseExperiment):
             X_0 = torch.cat([x0y0, t0], dim=1)
             u0 = self.u_star(X_0[:, 0:1], X_0[:, 1:2], X_0[:, 2:3])
 
-            return {"X_f": X_f, "X_b": X_b, "u_b": u_b, "X_0": X_0, "u0": u0}
+            batch = {"X_f": X_f, "X_b": X_b, "u_b": u_b, "X_0": X_0, "u0": u0}
 
         elif self.sampling_mode == "grid":
             M, T = self._XY.size(0), self._T.size(0)
@@ -115,7 +183,17 @@ class Helmholtz2D(BaseExperiment):
             X_0 = torch.cat([self._XY[idx0], torch.full((n_0,1), self.t0, device=self.device)], dim=1)
             u0 = self.u_star(X_0[:,0:1], X_0[:,1:2], X_0[:,2:3])
 
-            return {"X_f": X_f, "X_b": X_b, "u_b": u_b, "X_0": X_0, "u0": u0}
+            batch = {"X_f": X_f, "X_b": X_b, "u_b": u_b, "X_0": X_0, "u0": u0}
+
+        # --- NEW: attach noisy data mini-batch for data loss ---
+        if self.use_data and self.X_data is not None and self.n_data_batch > 0:
+            n = self.X_data.size(0)
+            k = min(self.n_data_batch, n)
+            idx = torch.randint(0, n, (k,), device=self.device)
+            batch["X_d"] = self.X_data[idx]
+            batch["y_d"] = self.y_data[idx]
+
+        return batch
 
     # ----- losses -----
     def pde_residual_loss(self, model, batch):
@@ -146,6 +224,31 @@ class Helmholtz2D(BaseExperiment):
         X0, u0 = batch["X_0"], batch["u0"]
         pred = model(X0)
         return (pred - u0).pow(2)
+    
+    def data_loss(self, model, batch):
+        if "X_d" not in batch or "y_d" not in batch:
+            return torch.tensor(0.0, device=self.device)
+        X_d = batch["X_d"]
+        y_d = batch["y_d"]
+        u_pred = model(X_d) # [N, 1]
+        err = u_pred - y_d # [N, 1]
+        residual = (y_d - u_pred) # [N, 1]
+        
+        if self.ebm is not None and residual.numel() > 0:
+            # detach so EBM does not backprop into PINN
+            nll_ebm = self.ebm.train_step(residual.detach())
+            # you can log this later via train.py if you like:
+            batch["ebm_nll"] = nll_ebm
+
+            # --- 2) Compute per-point reliability weights from EBM ---
+            w = self.ebm.pointwise_weights(residual.detach())  # [N,1], mean(w) ≈ 1
+        else:
+            w = torch.ones_like(err)
+
+        # --- 3) Weighted per-sample data loss (PDE is unchanged) ---
+        # return vector of per-sample losses; train.py will take .mean()
+        loss_per_sample = (w * err.pow(2)).view(-1)
+        return loss_per_sample
 
     # ----- eval & plots -----
     def relative_l2_on_grid(self, model, grid_cfg):
@@ -185,29 +288,35 @@ class Helmholtz2D(BaseExperiment):
                 figs.update(out)
         return figs
     
-    def make_video(self, model, grid, out_dir, fps=10, filename="evolution.mp4"):
+    def make_video(self, model, grid, out_dir, fps=10, filename="final_evolution.mp4"):
         """
-        Make a video over t ∈ [t0, t1] comparing:
-          (1) true solution u*(x,y,t),
-          (2) model prediction u(x,y,t),
-          (3) absolute error |u* - u|.
-        Frames share fixed color scales across time for visual fairness.
+        Make a video over t ∈ [t0, t1] with 4 panels:
+
+            [0,0] Noisy data over entire domain: u*(x,y,t) + ε(x,y,t)
+            [0,1] True solution u*(x,y,t)
+            [1,0] Predicted solution u_hat(x,y,t)
+            [1,1] Absolute error |u* - u_hat|
+
+        - Color scales for u / noisy panels are consistent across time.
+        - Error color scale is also global across time.
+        - If noise is disabled (no self.noise_model), the noisy panel = true solution.
 
         Args:
-            model: trained model
-            grid: dict with keys {"nx","ny","nt"} (same structure as eval grid)
-            out_dir: directory to save the video into
+            model: trained PINN model
+            grid: dict with keys {"nx","ny","nt"}
+            out_dir: directory to save video
             fps: frames per second
-            filename: output name with extension .mp4 or .gif
+            filename: video file name (default: final_evolution.mp4)
+
         Returns:
-            Full path to the saved video.
+            Full path to the main evolution video.
         """
-
         os.makedirs(out_dir, exist_ok=True)
-        path = os.path.join(out_dir, filename)
+        nx = int(grid.get("nx", 100))
+        ny = int(grid.get("ny", 100))
+        nt = int(grid.get("nt", 100))
 
-        nx, ny, nt = int(grid["nx"]), int(grid["ny"]), int(grid["nt"])
-        # Build spatial grid once
+        # Build spatial grid
         Xg, Yg = linspace_2d(
             self.rect.xa, self.rect.xb,
             self.rect.ya, self.rect.yb,
@@ -215,7 +324,13 @@ class Helmholtz2D(BaseExperiment):
         )
         ts = torch.linspace(self.t0, self.t1, nt, device=self.rect.device)
 
-        # Precompute color limits for consistent scales across time
+        extent = [float(self.rect.xa), float(self.rect.xb),
+                float(self.rect.ya), float(self.rect.yb)]
+
+        # Check if we have a noise model
+        has_noise_model = getattr(self, "noise_model", None) is not None
+
+        # ---------- First pass: determine global color ranges ----------
         vmin, vmax = None, None
         err_max = 0.0
 
@@ -223,52 +338,100 @@ class Helmholtz2D(BaseExperiment):
         with torch.no_grad():
             for tval in ts:
                 T = torch.full_like(Xg, tval)
-                XYT = torch.stack([Xg.reshape(-1), Yg.reshape(-1), T.reshape(-1)], dim=1)
-                U_pred = model(XYT).reshape(nx, ny)          # [nx, ny]
-                U_true = self.u_star(Xg, Yg, T)              # [nx, ny]
+                XYT = torch.stack(
+                    [Xg.reshape(-1), Yg.reshape(-1), T.reshape(-1)], dim=1
+                )  # [nx*ny, 3]
 
-                umin = min(U_true.min().item(), U_pred.min().item())
-                umax = max(U_true.max().item(), U_pred.max().item())
+                U_pred = model(XYT).reshape(nx, ny)    # [nx, ny]
+                U_true = self.u_star(Xg, Yg, T)        # [nx, ny]
+
+                if has_noise_model:
+                    eps = self.noise_model.sample([nx * ny]).to(self.rect.device)
+                    eps = eps.view(nx, ny)
+                    U_noisy = U_true + eps
+                else:
+                    U_noisy = U_true
+
+                # Global color range for all "solution-like" panels
+                umin = min(U_true.min().item(), U_pred.min().item(), U_noisy.min().item())
+                umax = max(U_true.max().item(), U_pred.max().item(), U_noisy.max().item())
                 vmin = umin if vmin is None else min(vmin, umin)
                 vmax = umax if vmax is None else max(vmax, umax)
 
+                # Error scale
                 err_max = max(err_max, (U_true - U_pred).abs().max().item())
 
-        # Render frames
-        frames = []
-        extent = [float(self.rect.xa), float(self.rect.xb),
-                  float(self.rect.ya), float(self.rect.yb)]
+        # Safety
+        if err_max <= 0:
+            err_max = 1e-6
 
+        # ---------- Second pass: render frames ----------
+        frames = []
         with torch.no_grad():
-            for i, tval in enumerate(ts):
+            for tval in ts:
                 T = torch.full_like(Xg, tval)
-                XYT = torch.stack([Xg.reshape(-1), Yg.reshape(-1), T.reshape(-1)], dim=1)
+                XYT = torch.stack(
+                    [Xg.reshape(-1), Yg.reshape(-1), T.reshape(-1)], dim=1
+                )
+
                 U_pred = model(XYT).reshape(nx, ny).cpu().numpy()
                 U_true = self.u_star(Xg, Yg, T).cpu().numpy()
-                U_err  = np.abs(U_true - U_pred)
 
-                fig = plt.figure(figsize=(12, 3.6), dpi=120)
+                if has_noise_model:
+                    eps = self.noise_model.sample([nx * ny]).to(self.rect.device)
+                    eps = eps.view(nx, ny).cpu().numpy()
+                    U_noisy = U_true + eps
+                else:
+                    U_noisy = U_true  # fallback: no noise → same as true
+
+                U_err = np.abs(U_true - U_pred)
+
+                fig = plt.figure(figsize=(12, 12), dpi=120)
                 plt.suptitle(f"t = {float(tval):.5f}")
 
-                ax1 = plt.subplot(1, 3, 1)
-                im1 = ax1.imshow(U_true.T, origin="lower", extent=extent, vmin=vmin, vmax=vmax, aspect="auto")
-                ax1.set_title("True")
+                # [0,0] Noisy data over whole domain
+                ax1 = plt.subplot(2, 2, 1)
+                im1 = ax1.imshow(
+                    U_noisy.T, origin="lower", extent=extent,
+                    vmin=vmin, vmax=vmax, aspect="auto"
+                )
+                ax1.set_title("Noisy data: u*(x,y,t) + ε")
                 ax1.set_xlabel("x"); ax1.set_ylabel("y")
                 fig.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
 
-                ax2 = plt.subplot(1, 3, 2)
-                im2 = ax2.imshow(U_pred.T, origin="lower", extent=extent, vmin=vmin, vmax=vmax, aspect="auto")
-                ax2.set_title("Pred")
+                # [0,1] True solution
+                ax2 = plt.subplot(2, 2, 2)
+                im2 = ax2.imshow(
+                    U_true.T, origin="lower", extent=extent,
+                    vmin=vmin, vmax=vmax, aspect="auto"
+                )
+                ax2.set_title("True solution u*(x,y,t)")
                 ax2.set_xlabel("x"); ax2.set_ylabel("y")
                 fig.colorbar(im2, ax=ax2, fraction=0.046, pad=0.04)
 
-                ax3 = plt.subplot(1, 3, 3)
-                im3 = ax3.imshow(U_err.T, origin="lower", extent=extent, vmin=0.0, vmax=err_max, aspect="auto")
-                ax3.set_title("|Error|")
+                # [1,0] Predicted solution
+                ax3 = plt.subplot(2, 2, 3)
+                im3 = ax3.imshow(
+                    U_pred.T, origin="lower", extent=extent,
+                    vmin=vmin, vmax=vmax, aspect="auto"
+                )
+                ax3.set_title("Predicted solution û(x,y,t)")
                 ax3.set_xlabel("x"); ax3.set_ylabel("y")
                 fig.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
 
-                # Convert figure to RGB frame (no file I/O for intermediates)
+                # [1,1] Absolute error
+                ax4 = plt.subplot(2, 2, 4)
+                im4 = ax4.imshow(
+                    U_err.T, origin="lower", extent=extent,
+                    vmin=0.0, vmax=err_max, aspect="auto"
+                )
+                ax4.set_title("|Error| = |u* - û|")
+                ax4.set_xlabel("x"); ax4.set_ylabel("y")
+                fig.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
+
+                fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+                # Convert figure to frame
                 fig.canvas.draw()
                 w, h = fig.canvas.get_width_height()
                 buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
@@ -276,12 +439,12 @@ class Helmholtz2D(BaseExperiment):
                 frames.append(frame.copy())
                 plt.close(fig)
 
-        # Write video (mp4 or gif)
+        # ---------- Write video ----------
         ext = os.path.splitext(filename)[1].lower()
+        path = os.path.join(out_dir, filename)
         if ext == ".gif":
             imageio.mimsave(path, frames, fps=fps)
         elif ext == ".mp4":
-            # imageio will use ffmpeg if available; otherwise users can switch to .gif
             writer = imageio.get_writer(path, fps=fps, codec="libx264", quality=7)
             for fr in frames:
                 writer.append_data(fr)
@@ -289,4 +452,202 @@ class Helmholtz2D(BaseExperiment):
         else:
             raise ValueError(f"Unsupported video format: {ext}")
 
+        # (optional) still call your noise-distribution video helper if you keep it
+        try:
+            self._make_noise_videos(model, grid, out_dir, fps, filename)
+        except Exception as e:
+            print(f"[make_video] Warning: noise video failed with error: {e}")
+
         return path
+    
+    def _make_noise_videos(self, model, grid, out_dir, fps, filename):
+        """
+        Create a single video visualizing noise over the whole domain.
+
+        For each time slice t_k, the figure has 4 panels:
+
+            [0,0]  True noise field ε*(x,y,t_k) sampled on the full grid
+            [0,1]  Residual field r(x,y,t_k) = y_noisy - u_pred
+
+                   where y_noisy = u*(x,y,t_k) + ε*(x,y,t_k)
+
+            [1,0]  Histograms of ε* and r on the same axes
+            [1,1]  True noise pdf vs EBM pdf on the same axes
+
+        This satisfies:
+          - True vs predicted noise distributions in the SAME figure.
+          - Noise distribution measured over the WHOLE domain, not just sampled data points.
+        """
+        # Need both true noise model and EBM to make this meaningful
+        if getattr(self, "noise_model", None) is None:
+            return None, None
+        if getattr(self, "ebm", None) is None:
+            # You could still visualize true noise only, but here we require both.
+            return None, None
+
+        base, ext = os.path.splitext(filename)
+        if ext == "":
+            ext = ".mp4"
+
+        os.makedirs(out_dir, exist_ok=True)
+
+        nx = int(grid.get("nx", 50))
+        ny = int(grid.get("ny", 50))
+        nt = int(grid.get("nt", 50))
+
+        # Spatial grid
+        Xg, Yg = linspace_2d(
+            self.rect.xa, self.rect.xb,
+            self.rect.ya, self.rect.yb,
+            nx, ny, self.rect.device
+        )
+        ts = torch.linspace(self.t0, self.t1, nt, device=self.rect.device)
+
+        extent = [float(self.rect.xa), float(self.rect.xb),
+                  float(self.rect.ya), float(self.rect.yb)]
+
+        frames = []
+
+        model.eval()
+        with torch.no_grad():
+            for tval in ts:
+                # Build full space-time grid
+                T = torch.full_like(Xg, tval)
+                XYT = torch.stack(
+                    [Xg.reshape(-1), Yg.reshape(-1), T.reshape(-1)], dim=1
+                )  # [nx*ny, 3]
+
+                # True solution and prediction on full grid
+                U_true = self.u_star(Xg, Yg, T)                  # [nx, ny]
+                U_pred = model(XYT).reshape(nx, ny)              # [nx, ny]
+
+                # Sample true noise on full grid (whole domain)
+                eps_true_flat = self.noise_model.sample([nx * ny]).to(self.rect.device)
+                eps_true = eps_true_flat.view(nx, ny)            # [nx, ny]
+
+                # Noisy observations and residuals
+                Y_noisy = U_true + eps_true                      # [nx, ny]
+                R_field = (Y_noisy - U_pred)                     # [nx, ny]
+
+                # Flatten for 1D distributions
+                eps_flat = eps_true.detach().cpu().numpy().reshape(-1)
+                res_flat = R_field.detach().cpu().numpy().reshape(-1)
+
+                # Range for plots / pdf grid
+                max_val = max(
+                    float(np.max(np.abs(eps_flat))) if eps_flat.size > 0 else 0.0,
+                    float(np.max(np.abs(res_flat))) if res_flat.size > 0 else 0.0,
+                    1e-3,
+                )
+                R = 1.5 * max_val
+                r_grid = np.linspace(-R, R, 200, dtype=np.float32)
+                r_torch = torch.from_numpy(r_grid).float().to(self.rect.device)
+
+                # True noise pdf
+                pdf_true = None
+                if hasattr(self.noise_model, "pdf"):
+                    pdf_true = self.noise_model.pdf(r_torch).detach().cpu().numpy()
+
+                # EBM pdf (from log q_theta)
+                with torch.no_grad():
+                    log_q = self.ebm(r_torch.unsqueeze(-1)).squeeze(-1)  # [200]
+                    log_q = log_q - log_q.max()  # shift for numerical stability
+                    pdf_unn = torch.exp(log_q)   # unnormalized
+                    Z = torch.trapezoid(pdf_unn, r_torch)
+                    pdf_ebm = (pdf_unn / (Z + 1e-12)).cpu().numpy()
+
+                # ---- Build figure ----
+                fig, axes = plt.subplots(2, 2, figsize=(11, 7), dpi=120)
+                fig.suptitle(f"Noise distributions at t = {float(tval):.4f}")
+
+                # [0,0] True noise field ε*(x,y,t)
+                im0 = axes[0, 0].imshow(
+                    eps_true.cpu().numpy().T,
+                    origin="lower",
+                    extent=extent,
+                    vmin=-R,
+                    vmax=R,
+                    aspect="auto",
+                    cmap="coolwarm",
+                )
+                axes[0, 0].set_title("True noise field ε*(x,y,t)")
+                axes[0, 0].set_xlabel("x")
+                axes[0, 0].set_ylabel("y")
+                fig.colorbar(im0, ax=axes[0, 0], fraction=0.046, pad=0.04)
+
+                # [0,1] Residual field r(x,y,t)
+                im1 = axes[0, 1].imshow(
+                    R_field.cpu().numpy().T,
+                    origin="lower",
+                    extent=extent,
+                    vmin=-R,
+                    vmax=R,
+                    aspect="auto",
+                    cmap="coolwarm",
+                )
+                axes[0, 1].set_title("Residual field r(x,y,t) = y_noisy - u_pred")
+                axes[0, 1].set_xlabel("x")
+                axes[0, 1].set_ylabel("y")
+                fig.colorbar(im1, ax=axes[0, 1], fraction=0.046, pad=0.04)
+
+                # [1,0] Histograms of ε* and r on same axes
+                axes[1, 0].hist(
+                    eps_flat, bins=40, density=True,
+                    alpha=0.5, label="true noise sample ε*",
+                )
+                axes[1, 0].hist(
+                    res_flat, bins=40, density=True,
+                    alpha=0.5, label="residual sample r",
+                )
+                axes[1, 0].set_xlim(-R, R)
+                axes[1, 0].set_xlabel("value")
+                axes[1, 0].set_ylabel("density")
+                axes[1, 0].set_title("Empirical distributions over whole domain")
+                axes[1, 0].legend(loc="upper right", fontsize=8)
+
+                # [1,1] True pdf vs EBM pdf on same axes
+                if pdf_true is not None:
+                    axes[1, 1].plot(
+                        r_grid, pdf_true,
+                        label="true noise pdf",
+                        linewidth=1.5,
+                    )
+                axes[1, 1].plot(
+                    r_grid, pdf_ebm,
+                    label="EBM pdf",
+                    linestyle="--",
+                    linewidth=1.5,
+                )
+                axes[1, 1].set_xlim(-R, R)
+                axes[1, 1].set_xlabel("value")
+                axes[1, 1].set_ylabel("density")
+                axes[1, 1].set_title("True vs EBM noise pdf")
+                axes[1, 1].legend(loc="upper right", fontsize=8)
+
+                fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+                # Convert figure to frame
+                fig.canvas.draw()
+                w, h = fig.canvas.get_width_height()
+                buf = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+                frame = buf.reshape(h, w, 3)
+                frames.append(frame.copy())
+                plt.close(fig)
+
+        if not frames:
+            return None, None
+
+        # Save video
+        path_noise = os.path.join(out_dir, f"{base}_noise_dist{ext}")
+        if ext == ".gif":
+            imageio.mimsave(path_noise, frames, fps=fps)
+        elif ext == ".mp4":
+            writer = imageio.get_writer(path_noise, fps=fps, codec="libx264", quality=7)
+            for fr in frames:
+                writer.append_data(fr)
+            writer.close()
+        else:
+            raise ValueError(f"Unsupported video format: {ext}")
+
+        # For backward-compatibility, return (path_true, path_ebm) style if you want:
+        return path_noise, None

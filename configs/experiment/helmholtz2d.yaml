@@ -1,12 +1,12 @@
 # scripts/mlp/helmholtz2d.sh
 
-tag: test0
+tag: test3
 device: cuda
 
 domain:
-  x: [-2.0, 2.0]
-  y: [-2.0, 2.0]
-  t: [-2.0, 2.0]
+  x: [-1.0, 1.0]
+  y: [-1.0, 1.0]
+  t: [-1.0, 1.0]
 k: 2.0
 c: 1.0
 omega: auto
@@ -17,21 +17,36 @@ time_dependent: true
 # sampling
 sampling_mode: grid # random / grid
 grid:
-  nx: 128
-  ny: 128
-  nt: 64
+  nx: 100
+  ny: 100
+  nt: 50
 batch:
   n_f: 4096
   n_b: 1024
   n_0: 1024
+
+# noise
+noise:
+  enabled: true
+  n_train: 5000
+  batch_size: 1000
+  kind: G # G, Goff, sG, u, 3G, 3G0, mix0, Gmix, rmix, sGtest
+
+ebm:
+  enabled: true
+  hidden_dim: 32
+  depth: 3
+  num_grid: 256
+  max_range_factor: 2.5
+  lr: 1.0e-3
 
 # video
 video:
   enabled: true
   every: 10000
   grid:
-    nx: 128
-    ny: 128
-    nt: 64
+    nx: 100
+    ny: 100
+    nt: 50
   fps: 10
   format: mp4

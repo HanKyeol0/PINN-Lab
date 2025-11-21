@@ -1,7 +1,7 @@
 seed: 40
 device: "cuda"            # "cuda" or "cpu"
 train:
-  epochs: 50000
+  epochs: 20000
   batch:
     n_f: 4096             # collocation points
     n_b: 1024             # boundary points
@@ -17,10 +17,11 @@ train:
     res: 1.0    # PDE residual
     bc: 10.0   # boundary
     ic: 10.0  # initial
+    data: 10.0  # data loss
   loss_balancer:
     use_loss_balancer: true
     kind: softadapt        # one of: none | uncertainty | dwa | softadapt | gradnorm
-    terms: [res, bc, ic]
+    terms: [res, data] # bc, ic
     # DWA:
     T: 2.0
     # SoftAdapt:
@@ -43,29 +44,7 @@ log:
     mode: "online"      # "auto" | "offline" | "disabled"
 eval:
   grid:
-    nx: 200
-    ny: 200
-    nt: 100
+    nx: 100
+    ny: 100
+    nt: 50
   every: 100
-gradflow:
-  enabled: true
-  every: 200
-  store_vectors: true    # must be true if you want KDE
-  wandb_hist: false
-  max_keep: 20  # how many vectors to keep
-  stop_at: 10000
-  plot:
-    enabled: true          # <-- toggle all plotting
-    kde: true              # KDE of latest vectors per layer (paper-style) (KDE: kernel density estimation)
-    stats: true            # time-series curves of mean/max/L2 per layer
-    losses: ["bc", "res"]  # which losses to compare
-    loss_kde: true
-    loss_kde_filename: "gradflow_kde_losses.png"
-    kde_filename: "gradflow_kde.png"
-    stats_prefix: "gradflow_stats"
-    max_cols: 4            # subplots per row
-    tagging:
-      # Regex applied to full module names
-      # (keep them permissive; they only help classification)
-      main_regex: "(?:^|\\.)(?:main|central|body)(?:\\.|$)"
-      skip_regex: "(?:^|\\.)(?:skip|shortcut|proj|downsample)(?:\\.|$)"

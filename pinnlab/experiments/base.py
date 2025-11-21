@@ -22,6 +22,7 @@ class BaseExperiment(ABC):
     def pde_residual_loss(self, model, batch): return torch.tensor(0., device=self.device)
     def boundary_loss(self, model, batch):     return torch.tensor(0., device=self.device)
     def initial_loss(self, model, batch):      return torch.tensor(0., device=self.device)
+    def data_loss(self, model, batch):         return torch.tensor(0., device=self.device)
 
     @abstractmethod
     def relative_l2_on_grid(self, model, grid_cfg): ...

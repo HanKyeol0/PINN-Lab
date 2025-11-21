@@ -8,7 +8,6 @@ from pinnlab.utils.seed import seed_everything
 from pinnlab.utils.early_stopping import EarlyStopping
 from pinnlab.utils.plotting import save_plots_1d, save_plots_2d
 from pinnlab.utils.wandb_utils import setup_wandb, wandb_log, wandb_finish
-from pinnlab.utils.gradflow import GradientFlowLogger
 from pinnlab.utils.loss_balancer import BalancerConfig, make_loss_balancer
 from pinnlab.utils.plotting import plot_weights_over_time
 
@@ -62,7 +61,7 @@ def main(args):
         lb_cfg_dict = base_cfg["train"].get("loss_balancer", {})  # {'kind': 'dwa', 'terms': ['res','bc','ic'], ...}
         lb_cfg = BalancerConfig(**lb_cfg_dict)
         if not lb_cfg.terms:
-            lb_cfg.terms = ["res", "bc", "ic"]   # tailor per experiment
+            lb_cfg.terms = list(base_cfg["train"]["loss_weights"].keys()) # ["res", "bc", "ic", "data"]
 
         balancer = make_loss_balancer(lb_cfg)
 
@@ -98,20 +97,6 @@ def main(args):
             "base": base_cfg, "model": model_cfg, "experiment": exp_cfg
         })
 
-    # gradient flow logger
-    use_gradflow = base_cfg["gradflow"]["enabled"]
-    if use_gradflow:
-        gf = GradientFlowLogger(
-            model, out_dir,
-            enable=base_cfg.get("gradflow", {}).get("enabled", True),
-            every=int(base_cfg.get("gradflow", {}).get("every", 1000)),
-            store_vectors=bool(base_cfg.get("gradflow", {}).get("store_vectors", False)),
-            max_keep_per_layer=int(base_cfg.get("gradflow", {}).get("max_keep", 20)),
-            wandb_hist=bool(base_cfg.get("gradflow", {}).get("wandb_hist", False)),
-            plot_cfg=base_cfg.get("gradflow", {}).get("plot", {})
-        )
-        gf_stop = base_cfg["gradflow"]["stop_at"]
-
     epochs = base_cfg["train"]["epochs"]
     eval_every = int(base_cfg.get("eval").get("every", 100))
 
@@ -124,6 +109,7 @@ def main(args):
     w_res = base_cfg["train"]["loss_weights"]["res"]
     w_bc = base_cfg["train"]["loss_weights"]["bc"]
     w_ic = base_cfg["train"]["loss_weights"]["ic"]
+    w_data = base_cfg["train"]["loss_weights"]["data"]
 
     n_f = exp_cfg.get("batch", {}).get("n_f", base_cfg["train"]["batch"]["n_f"])
     n_b = exp_cfg.get("batch", {}).get("n_b", base_cfg["train"]["batch"]["n_b"])
@@ -152,28 +138,27 @@ def main(args):
         batch = exp.sample_batch(n_f=n_f, n_b=n_b, n_0=n_0)
 
         loss_res = exp.pde_residual_loss(model, batch).mean() if batch.get("X_f") is not None else torch.tensor(0., device=device)
-        loss_bc = exp.boundary_loss(model, batch).mean()     if batch.get("X_b") is not None else torch.tensor(0., device=device)
-        loss_ic = exp.initial_loss(model, batch).mean()      if batch.get("X_0") is not None else torch.tensor(0., device=device)
-
+        # loss_bc = exp.boundary_loss(model, batch).mean()      if batch.get("X_b") is not None else torch.tensor(0., device=device)
+        # loss_ic = exp.initial_loss(model, batch).mean()       if batch.get("X_0") is not None else torch.tensor(0., device=device)
+        loss_data = exp.data_loss(model, batch).mean()        if batch.get("X_d") is not None else torch.tensor(0., device=device)
+        
         loss_res_s = loss_res.mean() if torch.is_tensor(loss_res) and loss_res.dim() > 0 else loss_res # scalar
-        loss_bc_s = loss_bc.mean() if torch.is_tensor(loss_bc) and loss_bc.dim() > 0 else loss_bc
-        loss_ic_s = loss_ic.mean() if torch.is_tensor(loss_ic) and loss_ic.dim() > 0 else loss_ic
-
-        if use_gradflow and global_step % gf.every == 0:
-            if ep <= gf_stop:
-                gf.collect({"res": loss_res_s, "bc": loss_bc_s, "ic": loss_ic_s}, step=global_step)
+        # loss_bc_s = loss_bc.mean() if torch.is_tensor(loss_bc) and loss_bc.dim() > 0 else loss_bc
+        # loss_ic_s = loss_ic.mean() if torch.is_tensor(loss_ic) and loss_ic.dim() > 0 else loss_ic
+        loss_data_s = loss_data.mean() if torch.is_tensor(loss_data) and loss_data.dim() > 0 else loss_data
 
         losses = {
             "res": loss_res,     # PDE residual term
-            **({"bc": loss_bc} if "loss_bc" in locals() else {}),
-            **({"ic": loss_ic} if "loss_ic" in locals() else {}),
-            # **({"data": loss_data} if "loss_data" in locals() else {}),
+            # **({"bc": loss_bc} if "loss_bc" in locals() else {}),
+            # **({"ic": loss_ic} if "loss_ic" in locals() else {}),
+            **({"data": loss_data} if "loss_data" in locals() else {}),
         }
 
         if not use_loss_balancer:
-            total_loss = w_res*loss_res + w_bc*loss_bc + w_ic*loss_ic
-            s = (w_res + w_bc + w_ic) or 1.0
-            w_now = {"res": w_res/s, "bc": w_bc/s, "ic": w_ic/s}
+            total_loss = w_res*loss_res + w_data*loss_data
+            # total_loss = w_res*loss_res + w_bc*loss_bc + w_ic*loss_ic + w_data*loss_data
+            s = (w_res + w_bc + w_ic + w_data) or 1.0
+            w_now = {"res": w_res/s, "bc": w_bc/s, "ic": w_ic/s, "data": w_data/s}
         else:
             total_loss, w_dict, aux = balancer(losses, step=global_step, model=model)
             w_now = {k.split("/", 1)[1]: float(v) for k, v in w_dict.items()}
@@ -198,8 +183,9 @@ def main(args):
         log_payload = {
             "loss/total": float(total_loss.detach().cpu()),
             "loss/res": float(loss_res_s.detach().cpu()),
-            "loss/bc": float(loss_bc_s.detach().cpu()),
-            "loss/ic": float(loss_ic_s.detach().cpu()),
+            # "loss/bc": float(loss_bc_s.detach().cpu()),
+            # "loss/ic": float(loss_ic_s.detach().cpu()),
+            "loss/data": float(loss_data_s.detach().cpu()),
             "lr": optimizer.param_groups[0]["lr"],
             "epoch": ep,
             "perf/it_per_sec_tqdm": it_per_sec if it_per_sec is not None else 0.0,
@@ -252,6 +238,14 @@ def main(args):
             fps=fps, filename=f"final_evolution.{out_fmt}"
         )
         wandb_log({"video/evolution": wandb.Video(vid_path, format=out_fmt)})
+        
+        base, ext = os.path.splitext(os.path.basename(vid_path))
+        noise_true = os.path.join(out_dir, f"{base}_noise_true{ext}")
+        noise_ebm  = os.path.join(out_dir, f"{base}_noise_ebm{ext}")
+        if os.path.exists(noise_true):
+            wandb_log({"video/noise_true": wandb.Video(noise_true, format=out_fmt)})
+        if os.path.exists(noise_ebm):
+            wandb_log({"video/noise_ebm": wandb.Video(noise_ebm, format=out_fmt)})    
     
     wandb_log(final_perf)
 
@@ -259,13 +253,6 @@ def main(args):
     plot_weights_over_time(weights_csv, weights_png)
     print(f"[weights] saved: {weights_csv}")
     print(f"[weights] plot : {weights_png}")
-
-    if use_gradflow:
-        gf.save()
-        if gf.plot_enabled:
-            saved = gf.save_plots()
-            for p in saved:
-                print(f"[gradflow] saved plot: {p}")
 
     # Restore best
     if best_state:

@@ -75,6 +75,7 @@ class Helmholtz2D(BaseExperiment):
 
         ebm_cfg = cfg.get("ebm", {}) or {}
         self.use_ebm = bool(ebm_cfg.get("enabled", False))
+        self.use_nll = bool(ebm_cfg.get("use_nll", False))
         if self.use_ebm:
             self.ebm = EBM(
                 hidden_dim=ebm_cfg.get("hidden_dim", 32),
@@ -86,6 +87,21 @@ class Helmholtz2D(BaseExperiment):
             )
         else:
             self.ebm = None
+        
+        self.use_data_loss_balancer = bool(cfg.get("data_loss_balancer", {}).get("use_loss_balancer", False))
+
+        # ----- Optional trainable offset θ0 for non-zero mean noise (PINN-off style) -----
+        offset_cfg = cfg.get("offset", {}) or {}
+        self.use_offset = bool(offset_cfg.get("enabled", False))
+        if self.use_offset:
+            init = float(offset_cfg.get("init", 0.0))
+            # scalar parameter θ0 that will only be used in the DATA term
+            self.offset = torch.nn.Parameter(
+                torch.tensor(init, dtype=torch.float32, device=device)
+            )
+            print(f"[Helmholtz2D] Using trainable data offset θ0, init={init}")
+        else:
+            self.offset = None
 
     # ----- analytic fields -----
     def u_star(self, x, y, t):
@@ -110,7 +126,7 @@ class Helmholtz2D(BaseExperiment):
         # Sample input locations
         XY = self.rect.sample(n)  # [n, 2] in (x, y)
         t = torch.rand(n, 1, device=self.device) * (self.t1 - self.t0) + self.t0
-        X = torch.cat([XY, t], dim=1)              # [n, 3]
+        X = torch.cat([XY, t], dim=1)  # [n, 3]
 
         with torch.no_grad():
             u_clean = self.u_star(X[:, 0:1], X[:, 1:2], X[:, 2:3])  # [n, 1]
@@ -225,30 +241,78 @@ class Helmholtz2D(BaseExperiment):
         pred = model(X0)
         return (pred - u0).pow(2)
     
-    def data_loss(self, model, batch):
+    def data_loss(self, model, batch, phase=1):
         if "X_d" not in batch or "y_d" not in batch:
             return torch.tensor(0.0, device=self.device)
+
         X_d = batch["X_d"]
         y_d = batch["y_d"]
-        u_pred = model(X_d) # [N, 1]
-        err = u_pred - y_d # [N, 1]
-        residual = (y_d - u_pred) # [N, 1]
-        
-        if self.ebm is not None and residual.numel() > 0:
-            # detach so EBM does not backprop into PINN
-            nll_ebm = self.ebm.train_step(residual.detach())
-            # you can log this later via train.py if you like:
-            batch["ebm_nll"] = nll_ebm
 
-            # --- 2) Compute per-point reliability weights from EBM ---
-            w = self.ebm.pointwise_weights(residual.detach())  # [N,1], mean(w) ≈ 1
+        # Raw PINN prediction (this is what PDE/BC/IC see)
+        u_raw = model(X_d)  # [N, 1]
+
+        # For the DATA term, optionally add scalar offset θ0
+        if getattr(self, "use_offset", False) and self.offset is not None:
+            u_data = u_raw + self.offset  # broadcast θ0
         else:
-            w = torch.ones_like(err)
+            u_data = u_raw
 
-        # --- 3) Weighted per-sample data loss (PDE is unchanged) ---
-        # return vector of per-sample losses; train.py will take .mean()
-        loss_per_sample = (w * err.pow(2)).view(-1)
-        return loss_per_sample
+        # Residuals for data and for EBM
+        err = u_data - y_d              # [N, 1] (model - noisy data)
+        residual = (y_d - u_data)       # [N, 1] (data - model), used as "noise"
+        
+        if phase == 0:
+            if self.ebm is not None and residual.numel() > 0:
+                # Detach so EBM training does not backprop through PINN/θ0
+                nll_ebm, nll_ebm_mean = self.ebm.train_step(residual.detach())
+                batch["ebm_nll"] = nll_ebm_mean
+
+                if self.use_data_loss_balancer:
+                    print("[data_loss] Using EBM-based data loss balancer.")
+                    # Per-point reliability weights from EBM (mean ≈ 1)
+                    w = self.ebm.pointwise_weights(residual.detach())  # [N, 1]
+                    
+                    loss_per_sample = (w * err.pow(2)).view(-1)
+                else:
+                    print("[data_loss] NOT using EBM-based data loss balancer.")
+                    loss_per_sample = err.pow(2).view(-1)
+                return loss_per_sample
+            
+        elif phase == 1:
+            return err.pow(2).view(-1)
+        
+        elif phase == 2:
+            if self.ebm is not None and residual.numel() > 0:
+                # Detach so EBM training does not backprop through PINN/θ0
+                nll_ebm, nll_ebm_mean = self.ebm.train_step(residual.detach())
+                batch["ebm_nll"] = nll_ebm_mean
+
+                if self.use_nll:
+                    print("[data_loss] Using EBM-based NLL data loss.")
+                    data_loss = nll_ebm
+                else:
+                    print("[data_loss] Using MSE data loss.")
+                    data_loss = err.pow(2)
+                if self.use_data_loss_balancer:
+                    print("[data_loss] Using EBM-based data loss balancer.")
+                    # Per-point reliability weights from EBM (mean ≈ 1)
+                    w = self.ebm.pointwise_weights(residual.detach())  # [N, 1]
+
+                    loss_per_sample = (w * data_loss).view(-1)
+                else:
+                    print("[data_loss] NOT using EBM-based data loss balancer.")
+                    loss_per_sample = data_loss.view(-1)
+
+                return loss_per_sample
+        
+        else:
+            raise ValueError(f"Invalid phase for data_loss: {phase}")
+    
+    def extra_params(self):
+        """Experiment-specific trainable parameters (e.g., θ0)."""
+        if isinstance(getattr(self, "offset", None), torch.nn.Parameter):
+            return [self.offset]
+        return []
 
     # ----- eval & plots -----
     def relative_l2_on_grid(self, model, grid_cfg):
@@ -556,7 +620,7 @@ class Helmholtz2D(BaseExperiment):
                 # EBM pdf (from log q_theta)
                 with torch.no_grad():
                     log_q = self.ebm(r_torch.unsqueeze(-1)).squeeze(-1)  # [200]
-                    log_q = log_q# - log_q.max()  # shift for numerical stability
+                    log_q = log_q - log_q.max()  # shift for numerical stability
                     pdf_unn = torch.exp(log_q)   # unnormalized
                     Z = torch.trapezoid(pdf_unn, r_torch)
                     pdf_ebm = (pdf_unn / (Z + 1e-12)).cpu().numpy()

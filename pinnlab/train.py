@@ -40,7 +40,13 @@ def main(args):
     exp = get_experiment(args.experiment_name)(exp_cfg, device)
     model = get_model(args.model_name)(model_cfg).to(device)
     
+    # Experiment-specific trainable parameters (e.g., θ0 offset)
+    if hasattr(exp, "extra_params"):
+        exp_extra_params = list(exp.extra_params())
+    else:
+        exp_extra_params = []
     # Logging dir
+    
     tag = exp_cfg.get("tag", None)
     if tag:
         file_name = f"{args.experiment_name}_{args.model_name}_{tag}"
@@ -70,6 +76,8 @@ def main(args):
 
     # Optimizer
     params = list(model.parameters())
+    if exp_extra_params:
+        params += exp_extra_params
     if use_loss_balancer:
        params += list(balancer.extra_params())  # no-op for other schemes
 
@@ -99,12 +107,18 @@ def main(args):
 
     epochs = base_cfg["train"]["epochs"]
     eval_every = int(base_cfg.get("eval").get("every", 100))
+    use_phase = exp_cfg["phase"]["enabled"]
+    if use_phase:
+        phase1_epochs = exp_cfg["phase"]["phase1_epochs"]
+        phase2_epochs = exp_cfg["phase"]["phase2_epochs"]
+        print(f"Using phased training: phase 1 for {phase1_epochs} epochs, phase 2 for {phase2_epochs} epochs.")
 
     # Early stopping
     es_cfg = base_cfg["train"]["early_stopping"]
     early = EarlyStopping(patience=es_cfg["patience"], min_delta=es_cfg["min_delta"], eval_every=eval_every) if es_cfg["enabled"] else None
     best_state = None
     best_metric = float("inf")
+    best_extra_state = None  # for experiment-specific params (e.g., θ0)
 
     w_res = base_cfg["train"]["loss_weights"]["res"]
     w_data = base_cfg["train"]["loss_weights"]["data"]
@@ -118,25 +132,47 @@ def main(args):
     make_video_every = exp_cfg.get("video", {}).get("every", eval_every)
 
     use_tty = sys.stdout.isatty()
-    pbar = trange(
-        epochs,
-        desc="Training",
-        ncols=120,
-        dynamic_ncols=True,
-        leave=False,          # don't leave old bars behind
-        disable=not use_tty,  # if output is piped, avoid multiline spam
-    )
+    
+    if use_phase:
+        epochs = phase1_epochs
+        phase = 1
+        pbar1 = trange(
+            phase1_epochs,
+            desc="Phase 1 Training",
+            ncols=120,
+            dynamic_ncols=True,
+            leave=False,          # don't leave old bars behind
+            disable=not use_tty,  # if output is piped, avoid multiline spam
+        )
+        pbar2 = trange(
+            phase2_epochs,
+            desc="Phase 2 Training",
+            ncols=120,
+            dynamic_ncols=True,
+            leave=False,          # don't leave old bars behind
+            disable=not use_tty,  # if output is piped, avoid multiline spam
+        )
+    else:
+        phase = 0
+        pbar1 = trange(
+            epochs,
+            desc="Training",
+            ncols=120,
+            dynamic_ncols=True,
+            leave=False,          # don't leave old bars behind
+            disable=not use_tty,  # if output is piped, avoid multiline spam
+        )
 
     # Training loop
     print("training started")
     training_start_time = time.time()
     global_step = 0
-    for ep in pbar:
+    for ep in pbar1:
         model.train()
         batch = exp.sample_batch(n_f=n_f, n_b=n_b, n_0=n_0)
 
         loss_res = exp.pde_residual_loss(model, batch).mean() if batch.get("X_f") is not None else torch.tensor(0., device=device)
-        loss_data = exp.data_loss(model, batch).mean()        if batch.get("X_d") is not None else torch.tensor(0., device=device)
+        loss_data = exp.data_loss(model, batch, phase).mean()        if batch.get("X_d") is not None else torch.tensor(0., device=device)
         
         loss_res_s = loss_res.mean() if torch.is_tensor(loss_res) and loss_res.dim() > 0 else loss_res # scalar
         loss_data_s = loss_data.mean() if torch.is_tensor(loss_data) and loss_data.dim() > 0 else loss_data
@@ -165,8 +201,8 @@ def main(args):
         optimizer.step()
 
         # Log
-        it_per_sec = pbar.format_dict.get("rate", None)
-        elapsed_s  = pbar.format_dict.get("elapsed", None)
+        it_per_sec = pbar1.format_dict.get("rate", None)
+        elapsed_s  = pbar1.format_dict.get("elapsed", None)
         gpu_now = {
             "gpu/mem_alloc_mb": float(torch.cuda.memory_allocated(device)) / (1024**2),
             "gpu/mem_reserved_mb": float(torch.cuda.memory_reserved(device)) / (1024**2),
@@ -182,7 +218,7 @@ def main(args):
             **gpu_now,
         }
         wandb_log(log_payload, commit=True)
-        pbar.set_postfix({k: f"{v:.3e}" for k,v in log_payload.items() if "loss" in k})
+        pbar1.set_postfix({k: f"{v:.3e}" for k,v in log_payload.items() if "loss" in k})
         global_step += 1
 
         # Simple validation metric (relative L2 on a fixed grid)
@@ -194,8 +230,17 @@ def main(args):
             best_path = os.path.join(out_dir, "best.pt")
             if rel_l2 < (best_metric - es_cfg.get("min_delta", 0.0)):
                 best_metric = rel_l2
-                best_state = {k: v.clone() for k,v in model.state_dict().items()}
-                torch.save({k:v.detach().cpu() for k,v in best_state.items()}, best_path)
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+
+                # snapshot experiment-specific parameters (e.g., θ0)
+                if exp_extra_params:
+                    best_extra_state = [p.detach().clone() for p in exp_extra_params]
+
+                # Save checkpoint (model + optionally experiment extras)
+                save_dict = {k: v.detach().cpu() for k, v in best_state.items()}
+                if exp_extra_params:
+                    save_dict["_exp_extra"] = [p.detach().cpu() for p in exp_extra_params]
+                torch.save(save_dict, best_path)
 
             if early and early.step(rel_l2):
                 print(f"\n[EarlyStopping] Stopping at epoch {ep}. Best rel_l2={best_metric:.3e}")
@@ -209,6 +254,96 @@ def main(args):
                 model, vid_grid, out_dir, fps=fps,
                 filename=f"eval_ep{ep}.{out_fmt}"
             )
+            
+    if use_phase:
+        for ep in pbar2:
+            model.train()
+            batch = exp.sample_batch(n_f=n_f, n_b=n_b, n_0=n_0)
+            phase = 2
+            
+            loss_res = exp.pde_residual_loss(model, batch).mean() if batch.get("X_f") is not None else torch.tensor(0., device=device)
+            loss_data = exp.data_loss(model, batch, phase).mean()        if batch.get("X_d") is not None else torch.tensor(0., device=device)
+            
+            loss_res_s = loss_res.mean() if torch.is_tensor(loss_res) and loss_res.dim() > 0 else loss_res # scalar
+            loss_data_s = loss_data.mean() if torch.is_tensor(loss_data) and loss_data.dim() > 0 else loss_data
+            
+            losses = {
+                "res": loss_res,     # PDE residual term
+                **({"data": loss_data} if "loss_data" in locals() else {}),
+            }
+            
+            if not use_loss_balancer:
+                total_loss = w_res*loss_res + w_data*loss_data
+                s = (w_res + w_data) or 1.0
+                w_now = {"res": w_res/s, "data": w_data/s}
+            else:
+                total_loss, w_dict, aux = balancer(losses, step=global_step, model=model)
+                w_now = {k.split("/", 1)[1]: float(v) for k, v in w_dict.items()}
+            
+            # write one row per epoch/step
+            _ensure_weights_header(w_now.keys())
+            with open(weights_csv, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([global_step] + [w_now[t] for t in weights_terms])
+                
+            optimizer.zero_grad(set_to_none=True)
+            total_loss.backward()
+            optimizer.step()
+            
+            # Log
+            it_per_sec = pbar2.format_dict.get("rate", None)
+            elapsed_s  = pbar2.format_dict.get("elapsed", None)
+            gpu_now = {
+                "gpu/mem_alloc_mb": float(torch.cuda.memory_allocated(device)) / (1024**2),
+                "gpu/mem_reserved_mb": float(torch.cuda.memory_reserved(device)) / (1024**2),
+            }
+            log_payload = {
+                "loss/total": float(total_loss.detach().cpu()),
+                "loss/res": float(loss_res_s.detach().cpu()),
+                "loss/data": float(loss_data_s.detach().cpu()),
+                "lr": optimizer.param_groups[0]["lr"],
+                "epoch": ep + phase1_epochs,
+                "perf/it_per_sec_tqdm": it_per_sec if it_per_sec is not None else 0.0,
+                "perf/elapsed_sec": elapsed_s if elapsed_s is not None else 0.0,
+                **gpu_now,
+            }
+            wandb_log(log_payload, commit=True)
+            pbar2.set_postfix({k: f"{v:.3e}" for k,v in log_payload.items() if "loss" in k})
+            global_step += 1
+            
+            # Simple validation metric (relative L2 on a fixed grid)
+            if (ep % eval_every == 0 or ep == phase2_epochs-1):
+                with torch.no_grad():
+                    rel_l2 = exp.relative_l2_on_grid(model, base_cfg["eval"]["grid"])
+                wandb_log({"eval/rel_l2": rel_l2, "epoch": ep + phase1_epochs})
+                
+                best_path = os.path.join(out_dir, "best.pt")
+                if rel_l2 < (best_metric - es_cfg.get("min_delta", 0.0)):
+                    best_metric = rel_l2
+                    best_state = {k: v.clone() for k, v in model.state_dict().items()}
+                    
+                    # snapshot experiment-specific parameters (e.g., θ0)
+                    if exp_extra_params:
+                        best_extra_state = [p.detach().clone() for p in exp_extra_params]
+                    
+                    # Save checkpoint (model + optionally experiment extras)
+                    save_dict = {k: v.detach().cpu() for k, v in best_state.items()}
+                    if exp_extra_params:
+                        save_dict["_exp_extra"] = [p.detach().cpu() for p in exp_extra_params]
+                    torch.save(save_dict, best_path)
+                
+                if early and early.step(rel_l2):
+                    print(f"\n[EarlyStopping] Stopping at epoch {ep + phase1_epochs}. Best rel_l2={best_metric:.3e}")
+                    break
+
+            if enable_video and ((ep + phase1_epochs) % make_video_every == 0 and ep > 0):
+                vid_grid = exp_cfg.get("video", {}).get("grid", base_cfg["eval"]["grid"])
+                fps      = exp_cfg.get("video", {}).get("fps", 10)
+                out_fmt  = exp_cfg.get("video", {}).get("format", "mp4")  # "mp4" or "gif"
+                vid_path = exp.make_video(
+                    model, vid_grid, out_dir, fps=fps,
+                    filename=f"eval_ep{ep + phase1_epochs}.{out_fmt}"
+                )
 
     training_end_time = time.time()
     
@@ -246,6 +381,10 @@ def main(args):
     # Restore best
     if best_state:
         model.load_state_dict(best_state)
+        # Restore experiment-specific parameters (e.g., θ0) if we stored them
+        if best_extra_state is not None and exp_extra_params:
+            for p, best_p in zip(exp_extra_params, best_extra_state):
+                p.data.copy_(best_p.to(p.device))
 
     # Final evaluation & plots
     model.eval()

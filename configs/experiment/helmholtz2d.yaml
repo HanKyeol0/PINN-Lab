@@ -1,7 +1,7 @@
 # scripts/mlp/helmholtz2d.sh
 # scripts/mlp/z_helmholtz2d_fore.sh
 
-tag: test9
+tag: test11
 device: cuda
 
 domain:
@@ -33,6 +33,12 @@ noise:
   batch_size: 1000
   kind: 3G # G, Goff, sG, u, 3G, 3G0, mix0, Gmix, rmix, sGtest
 
+# phase
+phase:
+  enabled: true
+  phase1_epochs: 6000
+  phase2_epochs: 15000
+
 ebm:
   enabled: true
   hidden_dim: 32
@@ -40,6 +46,10 @@ ebm:
   num_grid: 256
   max_range_factor: 2.5
   lr: 1.0e-3
+  use_nll: true
+
+data_loss_balancer:
+  use_loss_balancer: true
 
 offset:
   enabled: true
@@ -48,7 +58,7 @@ offset:
 # video
 video:
   enabled: true
-  every: 10000
+  every: 5000
   grid:
     nx: 100
     ny: 100

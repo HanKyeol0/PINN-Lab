@@ -78,7 +78,7 @@ class EBM(nn.Module):
         res = res.detach().to(device=self.device, dtype=torch.float32).view(-1, 1)
         
         # data term: -log q_theta(r)
-        log_q_res = self.forward(res).squeeze(-1)
+        log_q_res = self.forward(res).squeeze(-1) # [N]
 
         # partition term log Z
         grid = self._make_grid(res)
@@ -89,8 +89,9 @@ class EBM(nn.Module):
         Z = torch.trapezoid(unnorm, grid)
         logZ = torch.log(Z + 1e-12) + m
 
-        nll = (-log_q_res + logZ).mean()
-        return nll
+        nll = -log_q_res + logZ
+        nll_mean = nll.mean()
+        return nll, nll_mean
 
     def train_step(self, res: torch.Tensor) -> torch.Tensor:
         """Perform one optimization step on a batch of residuals.
@@ -98,11 +99,11 @@ class EBM(nn.Module):
         Returns detached scalar NLL value (for logging).
         """
         self.train()
-        nll = self.mean_nll(res)
+        nll, nll_mean = self.mean_nll(res)
         self.optimizer.zero_grad()
-        nll.backward()
+        nll_mean.backward()
         self.optimizer.step()
-        return nll.detach()
+        return nll.detach(), nll_mean.detach()
 
     @torch.no_grad()
     def pointwise_weights(self, res: torch.Tensor) -> torch.Tensor:
